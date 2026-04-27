@@ -7,6 +7,8 @@
 - **هاب مستندات:** [`docs/README.md`](docs/README.md)
 - **فهرست انگلیسی:** [`docs/en/INDEX.md`](docs/en/INDEX.md)
 - **فهرست فارسی:** [`docs/fa/INDEX.md`](docs/fa/INDEX.md)
+- **تغییرات نسخه‌ها:** [`CHANGELOG.md`](CHANGELOG.md)
+- **Release Notes نسخه 1.2.0:** [`RELEASE_NOTES_v1.2.0.md`](RELEASE_NOTES_v1.2.0.md)
 
 ## شروع سریع
 
@@ -23,6 +25,18 @@ python main.py
 ```bash
 python main.py --telegram-profile
 python main.py
+```
+
+تشخیص سریع:
+
+```bash
+python main.py --telegram-diagnose
+```
+
+پروفایل هوشمند:
+
+```bash
+python main.py --profile strict_tg
 ```
 
 سپس در Telegram Desktop:

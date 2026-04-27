@@ -64,6 +64,17 @@ def prompt_yes_no(question: str, default: bool = True) -> bool:
             return False
 
 
+def prompt_choice(question: str, choices: list[str], default: str) -> str:
+    options = "/".join(choices)
+    while True:
+        raw = input(f"{cyan('?')} {question} [{options}] [{dim(default)}]: ").strip()
+        if not raw:
+            return default
+        if raw in choices:
+            return raw
+        print(red(f"  choose one of: {options}"))
+
+
 def random_auth_key(length: int = 32) -> str:
     alphabet = string.ascii_letters + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(length))
@@ -76,6 +87,7 @@ def apply_telegram_quick_profile(cfg: dict) -> dict:
     cfg["socks5_enabled"] = True
     cfg["socks5_port"] = int(cfg.get("socks5_port", 1080) or 1080)
     cfg["telegram_desktop_mode"] = True
+    cfg["profile"] = "balanced"
     cfg["lan_sharing"] = False
     cfg["proxy_auth_enabled"] = False
     cfg["proxy_username"] = ""
@@ -89,6 +101,14 @@ def apply_telegram_quick_profile(cfg: dict) -> dict:
     cfg["metrics_bucket_seconds"] = 30
     cfg["metrics_max_buckets"] = 240
     cfg["metrics_max_recent_events"] = 4000
+    cfg["telemetry_jsonl_enabled"] = False
+    cfg["telemetry_jsonl_path"] = "logs/telemetry.jsonl"
+    cfg["telemetry_jsonl_max_bytes"] = 5 * 1024 * 1024
+    cfg["telemetry_jsonl_backups"] = 3
+    cfg["route_rules_file"] = "route_rules.txt"
+    cfg["self_heal_enabled"] = True
+    cfg["self_heal_window_s"] = 120
+    cfg["self_heal_error_threshold"] = 5
     return cfg
 
 
@@ -107,6 +127,11 @@ def load_base_config() -> dict:
         "listen_port": 8085,
         "socks5_enabled": True,
         "socks5_port": 1080,
+        "profile": "balanced",
+        "proxy_auth_enabled": False,
+        "proxy_username": "",
+        "proxy_password": "",
+        "telegram_desktop_mode": True,
         "log_level": "INFO",
         "verify_ssl": True,
         "lan_sharing": False,
@@ -118,6 +143,14 @@ def load_base_config() -> dict:
         "chunked_download_chunk_size": 512 * 1024,
         "chunked_download_max_parallel": 8,
         "chunked_download_max_chunks": 256,
+        "telemetry_jsonl_enabled": False,
+        "telemetry_jsonl_path": "logs/telemetry.jsonl",
+        "telemetry_jsonl_max_bytes": 5 * 1024 * 1024,
+        "telemetry_jsonl_backups": 3,
+        "route_rules_file": "route_rules.txt",
+        "self_heal_enabled": True,
+        "self_heal_window_s": 120,
+        "self_heal_error_threshold": 5,
         "hosts": {},
     }
 
@@ -228,6 +261,11 @@ def configure_network(cfg: dict) -> dict:
         cfg["metrics_max_buckets"] = int(cfg.get("metrics_max_buckets", 180))
     else:
         cfg["admin_enabled"] = False
+    cfg["profile"] = prompt_choice(
+        "Runtime profile",
+        ["strict_tg", "balanced", "max_speed"],
+        default=str(cfg.get("profile", "balanced")),
+    )
     return cfg
 
 

@@ -403,3 +403,35 @@ def install_ca(cert_path: str, cert_name: str = CERT_NAME) -> bool:
     _install_firefox(cert_path, cert_name)
 
     return ok
+
+
+def ca_trust_hints(cert_path: str, cert_name: str = CERT_NAME) -> list[str]:
+    """Return actionable CA/browser trust hints for current platform."""
+    hints: list[str] = []
+    system = platform.system()
+    if not os.path.exists(cert_path):
+        hints.append(f"Certificate file is missing: {cert_path}")
+        return hints
+
+    trusted = is_ca_trusted(cert_path)
+    if trusted:
+        hints.append("OS trust store: certificate appears installed.")
+    else:
+        hints.append("OS trust store: certificate not detected.")
+        hints.append("Run: python main.py --install-cert")
+
+    if system == "Windows":
+        hints.append("Chrome/Edge use Windows trust store.")
+    elif system == "Darwin":
+        hints.append("Chrome/Safari use macOS Keychain trust.")
+    else:
+        hints.append("Most Linux Chromium/Firefox setups use OS/NSS trust stores.")
+
+    if _has_cmd("certutil"):
+        hints.append("Firefox NSS: certutil found, profile import can be automated.")
+    else:
+        hints.append(
+            "Firefox NSS: certutil not found; import ca/ca.crt manually in "
+            "Firefox Authorities."
+        )
+    return hints

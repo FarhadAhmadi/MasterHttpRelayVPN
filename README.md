@@ -7,6 +7,8 @@ Domain-fronted local proxy with Apps Script relay, Telegram Desktop compatibilit
 - **Documentation Hub:** [`docs/README.md`](docs/README.md)
 - **English Index:** [`docs/en/INDEX.md`](docs/en/INDEX.md)
 - **Farsi Index:** [`docs/fa/INDEX.md`](docs/fa/INDEX.md)
+- **Changelog:** [`CHANGELOG.md`](CHANGELOG.md)
+- **v1.2.0 Release Notes:** [`RELEASE_NOTES_v1.2.0.md`](RELEASE_NOTES_v1.2.0.md)
 
 ## Quick Start
 
@@ -30,6 +32,18 @@ Then configure Telegram Desktop proxy:
 - HTTP: `127.0.0.1:8085` (recommended)
 - SOCKS5: `127.0.0.1:1080`
 
+Run quick diagnostics:
+
+```bash
+python main.py --telegram-diagnose
+```
+
+Switch smart profile:
+
+```bash
+python main.py --profile strict_tg
+```
+
 ## Key v1 Features
 
 - HTTP + SOCKS5 local proxy
@@ -38,6 +52,11 @@ Then configure Telegram Desktop proxy:
 - HTTP/SOCKS proxy authentication
 - Built-in dashboard + API + Prometheus metrics
 - Route decision telemetry and troubleshooting visibility
+
+Optional rule file:
+
+- Copy `route_rules.example.txt` to `route_rules.txt`
+- Edit patterns like `telegram.org -> direct` or `*.google.com -> direct`
 
 ## Main Files
 

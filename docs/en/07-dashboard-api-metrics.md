@@ -13,6 +13,7 @@ Shows:
 - recent requests
 - route decision counters
 - live chart
+- self-heal auto-tune event counters
 
 ## API Endpoints
 
@@ -22,11 +23,30 @@ Shows:
 - `POST /api/reset`
 - `GET /healthz`
 
+`/api/summary` includes:
+
+- telemetry totals and timeseries
+- route decision counters
+- Telegram route stats
+- self-heal event counters
+- route rules metadata
+
 ## Prometheus
 
 - `GET /metrics`
 
 Includes request counters and route/Telegram route decision counters.
+
+## Persistent JSONL Logs (Optional)
+
+Enable in config:
+
+- `telemetry_jsonl_enabled: true`
+- `telemetry_jsonl_path: logs/telemetry.jsonl`
+- `telemetry_jsonl_max_bytes`
+- `telemetry_jsonl_backups`
+
+This keeps telemetry history across restarts without a database.
 
 ## Auth
 
@@ -35,4 +55,3 @@ If `admin_token` is set, include:
 ```http
 X-Admin-Token: your_token
 ```
-

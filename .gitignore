@@ -34,3 +34,6 @@ Thumbs.db
 
 # Temp MITM certs
 domainfront_certs_*/
+
+# Runtime telemetry/log output
+logs/

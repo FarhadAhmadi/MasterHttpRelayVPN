@@ -1,0 +1,17 @@
+# Route rules file (optional)
+# Format:
+#   <pattern> -> <action>
+# Actions: direct, relay, block, bypass
+#
+# Patterns support shell wildcards (fnmatch):
+#   telegram.org
+#   *.telegram.org
+#   *.google.com
+#   *
+
+telegram.org -> direct
+*.telegram.org -> direct
+*.google.com -> direct
+
+# Unknown domains can be forced through relay if needed:
+# * -> relay

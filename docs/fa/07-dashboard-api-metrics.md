@@ -13,6 +13,7 @@
 - recent requests
 - route decisions
 - نمودار زنده
+- شمارنده رویدادهای self-heal
 
 ## API
 
@@ -22,9 +23,28 @@
 - `POST /api/reset`
 - `GET /healthz`
 
+`/api/summary` شامل این بخش‌ها است:
+
+- مجموع تله‌متری و timeseries
+- شمارنده تصمیم‌های مسیر
+- آمار مسیرهای Telegram
+- شمارنده رویدادهای self-heal
+- اطلاعات route rules
+
 ## Prometheus
 
 - `GET /metrics`
+
+## لاگ JSONL (اختیاری)
+
+در config فعال کنید:
+
+- `telemetry_jsonl_enabled: true`
+- `telemetry_jsonl_path: logs/telemetry.jsonl`
+- `telemetry_jsonl_max_bytes`
+- `telemetry_jsonl_backups`
+
+این قابلیت تاریخچه متریک را بدون دیتابیس نگه می‌دارد.
 
 ## احراز هویت ادمین
 
@@ -33,4 +53,3 @@
 ```http
 X-Admin-Token: your_token
 ```
-

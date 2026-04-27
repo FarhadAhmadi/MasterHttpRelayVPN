@@ -18,6 +18,13 @@ Then start:
 python main.py
 ```
 
+Optional diagnostics:
+
+```bash
+python main.py --telegram-diagnose
+python main.py --profile strict_tg
+```
+
 ## Telegram Desktop Proxy Settings
 
 Preferred:
@@ -39,4 +46,3 @@ If proxy auth is enabled, use `proxy_username` + `proxy_password` from `config.j
 - `telegram_desktop_mode=true` enables fail-fast behavior for SOCKS IP-literal dead paths.
 - Helps Telegram rotate data centers faster on blocked routes.
 - Adaptive timeout and failure TTL logic reduce repeated stalls.
-

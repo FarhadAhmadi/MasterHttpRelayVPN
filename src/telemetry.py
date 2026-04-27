@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import time
 from collections import Counter, deque
 from dataclasses import dataclass
@@ -301,3 +302,51 @@ class TelemetryStore:
             b"Content-Length: " + str(len(body)).encode() + b"\r\n"
             b"\r\n" + body
         )
+
+
+class JsonlTelemetryWriter:
+    """Append-only JSONL writer with size-based rotation."""
+
+    def __init__(self, path: str, *, max_bytes: int = 5 * 1024 * 1024,
+                 backups: int = 3):
+        self.path = path
+        self.max_bytes = max(64 * 1024, int(max_bytes))
+        self.backups = max(1, int(backups))
+        self._lock = asyncio.Lock()
+
+    async def write(self, event: dict[str, Any]) -> None:
+        line = json.dumps(event, ensure_ascii=True) + "\n"
+        async with self._lock:
+            await asyncio.to_thread(self._write_sync, line)
+
+    def _rotate_sync(self) -> None:
+        for idx in range(self.backups, 0, -1):
+            old = f"{self.path}.{idx}"
+            new = f"{self.path}.{idx + 1}"
+            if idx == self.backups and os.path.exists(old):
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+            if os.path.exists(old):
+                try:
+                    os.replace(old, new)
+                except OSError:
+                    pass
+        if os.path.exists(self.path):
+            try:
+                os.replace(self.path, f"{self.path}.1")
+            except OSError:
+                pass
+
+    def _write_sync(self, line: str) -> None:
+        parent = os.path.dirname(self.path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        try:
+            if os.path.exists(self.path) and os.path.getsize(self.path) >= self.max_bytes:
+                self._rotate_sync()
+        except OSError:
+            pass
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(line)

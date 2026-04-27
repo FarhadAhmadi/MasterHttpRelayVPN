@@ -13,12 +13,14 @@
 ## ناپایداری Telegram
 
 - `--telegram-profile` را اجرا کنید.
+- `--telegram-diagnose` را اجرا کنید و خروجی «Fix» را اعمال کنید.
+- برای تنظیم سریع: `--profile strict_tg` یا `--profile balanced`
 - اول HTTP proxy را امتحان کنید.
 - `telegram_desktop_mode=true` بماند.
+- خروجی `--telegram-diagnose` شامل راهنمای trust گواهی/مرورگر نیز هست.
 
 ## کندی یا timeout
 
 - `python main.py --scan` و جایگزینی `google_ip`
 - چند `script_ids` اضافه کنید
 - از `/api/summary` و `/metrics` برای تحلیل استفاده کنید
-

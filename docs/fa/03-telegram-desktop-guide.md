@@ -14,6 +14,13 @@ python main.py --telegram-profile
 python main.py
 ```
 
+تشخیص و تنظیم سریع اختیاری:
+
+```bash
+python main.py --telegram-diagnose
+python main.py --profile strict_tg
+```
+
 ## تنظیمات Telegram Desktop
 
 حالت ترجیحی:
@@ -34,4 +41,3 @@ python main.py
 
 - با `telegram_desktop_mode=true` مسیرهای IP-literal ناموفق در SOCKS سریع‌تر fail می‌شوند.
 - این کار باعث چرخش سریع‌تر DC در Telegram می‌شود.
-

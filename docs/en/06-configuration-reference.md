@@ -17,6 +17,7 @@ Main config file: `config.json`
 - `proxy_auth_enabled`
 - `proxy_username`
 - `proxy_password`
+- `profile` (`strict_tg`, `balanced`, `max_speed`)
 
 ## Admin + metrics
 
@@ -24,6 +25,10 @@ Main config file: `config.json`
 - `metrics_max_recent_events`
 - `metrics_bucket_seconds`, `metrics_max_buckets`
 - `metrics_redact_query`, `metrics_hash_hosts`, `metrics_include_recent_paths`
+- `telemetry_jsonl_enabled`
+- `telemetry_jsonl_path`
+- `telemetry_jsonl_max_bytes`
+- `telemetry_jsonl_backups`
 
 ## Relay tuning
 
@@ -47,6 +52,17 @@ Main config file: `config.json`
 - `direct_google_exclude`
 - `direct_google_allow`
 - `youtube_via_relay`
+- `route_rules_file`
+- `self_heal_enabled`
+- `self_heal_window_s`
+- `self_heal_error_threshold`
+
+Route rules format:
+
+- `telegram.org -> direct`
+- `*.google.com -> direct`
+- `* -> relay`
+
+See example: [`route_rules.example.txt`](../../route_rules.example.txt)
 
 See defaults in [`config.example.json`](../../config.example.json).
-

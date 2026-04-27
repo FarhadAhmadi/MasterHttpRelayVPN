@@ -19,6 +19,8 @@ python main.py --admin-port 9191
 python main.py --disable-admin
 python main.py --telegram-desktop-mode
 python main.py --telegram-profile
+python main.py --telegram-diagnose
+python main.py --profile strict_tg
 ```
 
 ## Setup wizard
@@ -26,4 +28,3 @@ python main.py --telegram-profile
 ```bash
 python setup.py
 ```
-

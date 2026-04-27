@@ -12,6 +12,9 @@ import asyncio
 import json
 import logging
 import os
+import socket
+import ssl
+import time
 import sys
 
 # Project modules live under ./src — put that folder on sys.path so the
@@ -20,12 +23,13 @@ _SRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from cert_installer import install_ca, is_ca_trusted
+from cert_installer import ca_trust_hints, install_ca, is_ca_trusted
 from constants import __version__
 from lan_utils import log_lan_access
 from google_ip_scanner import scan_sync
 from logging_utils import configure as configure_logging, print_banner
 from mitm import CA_CERT_FILE
+from domain_fronter import DomainFronter
 from proxy_server import ProxyServer
 
 
@@ -94,6 +98,17 @@ def parse_args():
         help="Apply recommended Telegram Desktop settings to config and exit.",
     )
     parser.add_argument(
+        "--telegram-diagnose",
+        action="store_true",
+        help="Run Telegram connectivity diagnostics and print actionable hints.",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=["strict_tg", "balanced", "max_speed"],
+        default=None,
+        help="Apply a smart runtime profile and save it to config.",
+    )
+    parser.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         default=None,
@@ -151,6 +166,259 @@ def _apply_telegram_profile(config: dict) -> dict:
     return config
 
 
+def _apply_runtime_profile(config: dict, profile: str) -> dict:
+    out = dict(config)
+    out["profile"] = profile
+    if profile == "strict_tg":
+        out["telegram_desktop_mode"] = True
+        out["relay_timeout"] = 22
+        out["tls_connect_timeout"] = 10
+        out["tcp_connect_timeout"] = 6
+        out["chunked_download_max_parallel"] = 4
+        out["parallel_relay"] = 1
+        out["self_heal_enabled"] = True
+    elif profile == "balanced":
+        out["telegram_desktop_mode"] = True
+        out["relay_timeout"] = 25
+        out["tls_connect_timeout"] = 15
+        out["tcp_connect_timeout"] = 10
+        out["chunked_download_max_parallel"] = 8
+        out["parallel_relay"] = max(1, int(out.get("parallel_relay", 1)))
+        out["self_heal_enabled"] = True
+    elif profile == "max_speed":
+        out["telegram_desktop_mode"] = True
+        out["relay_timeout"] = 30
+        out["tls_connect_timeout"] = 15
+        out["tcp_connect_timeout"] = 8
+        out["chunked_download_max_parallel"] = 12
+        out["parallel_relay"] = max(2, int(out.get("parallel_relay", 2)))
+        out["self_heal_enabled"] = True
+    return out
+
+
+def _check_port_bind(host: str, port: int) -> tuple[bool, str]:
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    except OSError as exc:
+        return False, str(exc)
+    try:
+        sock.bind((host, int(port)))
+        return True, "free"
+    except OSError as exc:
+        return False, str(exc)
+    finally:
+        sock.close()
+
+
+def _probe_live_http_proxy(host: str, port: int,
+                           auth_enabled: bool) -> tuple[bool, str]:
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    except OSError as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    sock.settimeout(2.0)
+    try:
+        sock.connect((host, int(port)))
+        req = (
+            "GET http://example.com/ HTTP/1.1\r\n"
+            "Host: example.com\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode()
+        sock.sendall(req)
+        data = sock.recv(512)
+        if not data:
+            return False, "no response"
+        if b"407 Proxy Authentication Required" in data:
+            return auth_enabled, "proxy requires auth (expected)"
+        if b"HTTP/" in data:
+            return True, "proxy responded"
+        return False, "unexpected reply"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    finally:
+        sock.close()
+
+
+def _probe_live_socks5(host: str, port: int,
+                       auth_enabled: bool) -> tuple[bool, str]:
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    except OSError as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    sock.settimeout(2.0)
+    try:
+        sock.connect((host, int(port)))
+        if auth_enabled:
+            sock.sendall(b"\x05\x01\x02")
+            reply = sock.recv(2)
+            if reply == b"\x05\x02":
+                return True, "auth method required (expected)"
+            return False, f"unexpected method reply: {reply!r}"
+        sock.sendall(b"\x05\x01\x00")
+        reply = sock.recv(2)
+        if reply == b"\x05\x00":
+            return True, "no-auth method accepted"
+        return False, f"unexpected method reply: {reply!r}"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    finally:
+        sock.close()
+
+
+async def _probe_front_connect(front_domain: str, connect_ip: str,
+                               timeout: float) -> tuple[bool, str]:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        t0 = time.perf_counter()
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(
+                connect_ip, 443, ssl=ctx, server_hostname=front_domain
+            ),
+            timeout=timeout,
+        )
+        writer.write(
+            f"HEAD / HTTP/1.1\r\nHost: {front_domain}\r\nConnection: close\r\n\r\n".encode()
+        )
+        await writer.drain()
+        data = await asyncio.wait_for(reader.read(256), timeout=timeout)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        ms = int((time.perf_counter() - t0) * 1000)
+        if data.startswith(b"HTTP/"):
+            return True, f"ok ({ms}ms)"
+        return False, f"non-http reply ({ms}ms)"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+async def _probe_relay_latency(config: dict) -> tuple[bool, str]:
+    fronter = DomainFronter(config)
+    t0 = time.perf_counter()
+    try:
+        raw = await asyncio.wait_for(
+            fronter.relay("HEAD", "http://example.com/", {}, b""),
+            timeout=float(config.get("relay_timeout", 25)),
+        )
+        status, _, _ = fronter._split_raw_response(raw)
+        ms = int((time.perf_counter() - t0) * 1000)
+        if 200 <= status < 500:
+            return True, f"status={status} ({ms}ms)"
+        return False, f"status={status} ({ms}ms)"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    finally:
+        try:
+            await fronter.close()
+        except Exception:
+            pass
+
+
+def _run_telegram_diagnose(config: dict) -> int:
+    print("Telegram Diagnose")
+    print("=================")
+    issues = 0
+
+    host = str(config.get("listen_host", "127.0.0.1"))
+    http_port = int(config.get("listen_port", 8085))
+    socks_host = str(config.get("socks5_host", host))
+    socks_port = int(config.get("socks5_port", 1080))
+
+    ok_http_bind, http_bind_msg = _check_port_bind(host, http_port)
+    ok_socks_bind, socks_bind_msg = _check_port_bind(socks_host, socks_port)
+    print(
+        f"[HTTP port bind]  {host}:{http_port} -> "
+        f"{'OK' if ok_http_bind else 'FAIL'} ({http_bind_msg})"
+    )
+    print(
+        f"[SOCKS port bind] {socks_host}:{socks_port} -> "
+        f"{'OK' if ok_socks_bind else 'FAIL'} ({socks_bind_msg})"
+    )
+    if not ok_http_bind or not ok_socks_bind:
+        perm_http = "operation not permitted" in http_bind_msg.lower()
+        perm_socks = "operation not permitted" in socks_bind_msg.lower()
+        if perm_http and perm_socks:
+            print("  Hint: local socket checks were blocked by runtime permissions; skipping.")
+        else:
+            in_use_http = "in use" in http_bind_msg.lower() or "10048" in http_bind_msg
+            in_use_socks = "in use" in socks_bind_msg.lower() or "10048" in socks_bind_msg
+            if in_use_http and in_use_socks:
+                print("  Hint: both ports are already in use (proxy likely running).")
+            else:
+                issues += 1
+    else:
+        print("  Hint: ports are free (proxy not currently running) or reusable.")
+
+    auth_enabled = bool(config.get("proxy_auth_enabled", False))
+    live_http_ok, live_http_msg = _probe_live_http_proxy(host, http_port, auth_enabled)
+    live_socks_ok, live_socks_msg = _probe_live_socks5(socks_host, socks_port, auth_enabled)
+    print(f"[HTTP proxy live]  {'OK' if live_http_ok else 'INFO'} ({live_http_msg})")
+    print(f"[SOCKS5 live]      {'OK' if live_socks_ok else 'INFO'} ({live_socks_msg})")
+    if ("ConnectionRefusedError" in live_http_msg and "ConnectionRefusedError" in live_socks_msg):
+        print("  Hint: start `python main.py` first, then rerun --telegram-diagnose for live checks.")
+
+    ca_ok = is_ca_trusted(CA_CERT_FILE)
+    print(f"[CA trust]        {'OK' if ca_ok else 'FAIL'} ({CA_CERT_FILE})")
+    for hint in ca_trust_hints(CA_CERT_FILE):
+        print(f"  Hint: {hint}")
+    if not ca_ok:
+        issues += 1
+        print("  Fix: run `python main.py --install-cert` then restart clients.")
+
+    front_domain = str(config.get("front_domain", "www.google.com"))
+    connect_ip = str(config.get("google_ip", "216.239.38.120"))
+    ok_front, front_msg = asyncio.run(
+        _probe_front_connect(front_domain, connect_ip, timeout=6.0)
+    )
+    print(
+        f"[Front tunnel]    {'OK' if ok_front else 'FAIL'} "
+        f"({front_domain} via {connect_ip}: {front_msg})"
+    )
+    if not ok_front and "operation not permitted" not in front_msg.lower():
+        issues += 1
+        print("  Fix: run `python main.py --scan` and use a reachable google_ip.")
+    elif not ok_front:
+        print("  Hint: outbound socket test blocked by runtime permissions; skipping.")
+
+    ok_relay, relay_msg = asyncio.run(_probe_relay_latency(config))
+    print(f"[Relay latency]   {'OK' if ok_relay else 'FAIL'} ({relay_msg})")
+    if not ok_relay and "operation not permitted" not in relay_msg.lower():
+        issues += 1
+        print("  Fix: verify script_id/auth_key and Apps Script quota/deployment.")
+    elif not ok_relay:
+        print("  Hint: relay test blocked by runtime permissions; skipping.")
+
+    if bool(config.get("proxy_auth_enabled", False)):
+        user = str(config.get("proxy_username", "")).strip()
+        pwd = str(config.get("proxy_password", "")).strip()
+        auth_ok = bool(user and pwd)
+        print(f"[Proxy auth]      {'OK' if auth_ok else 'FAIL'} (enabled)")
+        if not auth_ok:
+            issues += 1
+            print("  Fix: set proxy_username and proxy_password.")
+    else:
+        print("[Proxy auth]      INFO (disabled)")
+
+    print(
+        f"[Telegram mode]   "
+        f"{'ON' if config.get('telegram_desktop_mode', False) else 'OFF'}"
+    )
+    if not config.get("telegram_desktop_mode", False):
+        print("  Hint: set telegram_desktop_mode=true for faster DC failover.")
+
+    print("\nResult:")
+    if issues == 0:
+        print("  PASS - Telegram stack looks healthy.")
+        print(f"  Telegram proxy (recommended): HTTP 127.0.0.1:{http_port}")
+        return 0
+    print(f"  NEEDS ATTENTION - {issues} issue(s) detected.")
+    return 1
+
+
 def main():
     args = parse_args()
     config_path = args.config
@@ -189,6 +457,10 @@ def main():
         print(f"Invalid JSON in config: {e}")
         sys.exit(1)
 
+    profile_name = str(config.get("profile", "")).strip()
+    if profile_name in {"strict_tg", "balanced", "max_speed"}:
+        config = _apply_runtime_profile(config, profile_name)
+
     if args.telegram_profile:
         config = _apply_telegram_profile(config)
         with open(config_path, "w", encoding="utf-8") as f:
@@ -201,6 +473,17 @@ def main():
         print("  Proxy auth : disabled (proxy_auth_enabled=false)")
         print("Now run: python main.py")
         return
+
+    if args.profile:
+        config = _apply_runtime_profile(config, args.profile)
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+            f.write("\n")
+        print(f"Profile '{args.profile}' applied and saved to: {config_path}")
+
+    if args.telegram_diagnose:
+        rc = _run_telegram_diagnose(config)
+        sys.exit(rc)
 
     # Environment variable overrides
     if os.environ.get("DFT_AUTH_KEY"):

@@ -21,6 +21,7 @@
 - Response cache for static assets
 - Parallel and streamed range-download acceleration
 - Adaptive direct timeout for repeated failures
+- Self-healing runtime tuning for repeated relay errors
 
 ## Security
 
@@ -35,4 +36,11 @@
 - JSON admin endpoints
 - Prometheus text metrics
 - Route decision counters and Telegram-specific counters
+- Optional persistent JSONL telemetry logs with rotation
 
+## Telegram-focused
+
+- `--telegram-profile` one-command setup
+- `--telegram-diagnose` quick local connectivity diagnosis
+- Telegram domain direct-preferred routing in Telegram mode
+- SOCKS IP-literal fail-fast behavior for faster DC rotation

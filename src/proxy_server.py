@@ -10,12 +10,14 @@ import asyncio
 import base64
 import hmac
 import logging
+import os
 import re
 import socket
 import ssl
 import time
 import ipaddress
 from collections import Counter
+from fnmatch import fnmatch
 from urllib.parse import urlparse
 
 try:
@@ -45,7 +47,7 @@ from constants import (
     UNCACHEABLE_HEADER_NAMES,
 )
 from domain_fronter import DomainFronter
-from telemetry import TelemetryStore
+from telemetry import JsonlTelemetryWriter, TelemetryStore
 
 log = logging.getLogger("Proxy")
 
@@ -225,6 +227,18 @@ class ProxyServer:
                 config, "metrics_max_buckets", 180, minimum=10,
             ),
         )
+        self._telemetry_jsonl_writer = None
+        if bool(config.get("telemetry_jsonl_enabled", False)):
+            self._telemetry_jsonl_writer = JsonlTelemetryWriter(
+                str(config.get("telemetry_jsonl_path", "logs/telemetry.jsonl")),
+                max_bytes=self._cfg_int(
+                    config, "telemetry_jsonl_max_bytes", 5 * 1024 * 1024,
+                    minimum=64 * 1024,
+                ),
+                backups=self._cfg_int(
+                    config, "telemetry_jsonl_backups", 3, minimum=1,
+                ),
+            )
         self._admin_enabled = bool(config.get("admin_enabled", True))
         self._admin_host = str(config.get("admin_host", "127.0.0.1"))
         self._admin_port = self._cfg_int(
@@ -235,6 +249,15 @@ class ProxyServer:
         self._proxy_username = str(config.get("proxy_username", ""))
         self._proxy_password = str(config.get("proxy_password", ""))
         self._telegram_desktop_mode = bool(config.get("telegram_desktop_mode", False))
+        self._self_heal_enabled = bool(config.get("self_heal_enabled", True))
+        self._self_heal_window_s = self._cfg_int(
+            config, "self_heal_window_s", 120, minimum=10,
+        )
+        self._self_heal_error_threshold = self._cfg_int(
+            config, "self_heal_error_threshold", 5, minimum=2,
+        )
+        self._host_relay_errors: dict[str, list[float]] = {}
+        self._auto_tune_events: Counter[str] = Counter()
         self._tcp_connect_timeout = self._cfg_float(
             config, "tcp_connect_timeout", TCP_CONNECT_TIMEOUT, minimum=1.0,
         )
@@ -258,6 +281,8 @@ class ProxyServer:
                 )
             )
         )
+        self._route_rules_file = str(config.get("route_rules_file", "route_rules.txt"))
+        self._route_rules = self._load_route_rules(self._route_rules_file)
 
         # hosts override — DNS fake-map: domain/suffix → IP
         # Checked before any real DNS lookup; supports exact and suffix matching.
@@ -393,6 +418,51 @@ class ProxyServer:
             and hmac.compare_digest(supplied_pass, self._proxy_password)
         )
 
+    @staticmethod
+    def _load_route_rules(path: str) -> list[tuple[str, str]]:
+        """Load simple route rules from file.
+
+        File format (one per line):
+          <pattern> -> <action>
+        Example:
+          telegram.org -> direct
+          *.google.com -> direct
+          *.blocked.example -> relay
+
+        Supported actions: direct, relay, block, bypass
+        """
+        rules: list[tuple[str, str]] = []
+        if not path:
+            return rules
+        try:
+            if not os.path.exists(path):
+                return rules
+            with open(path, "r", encoding="utf-8") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "->" not in line:
+                        continue
+                    pat, action = [x.strip().lower() for x in line.split("->", 1)]
+                    if not pat:
+                        continue
+                    if action not in {"direct", "relay", "block", "bypass"}:
+                        continue
+                    rules.append((pat, action))
+        except Exception as exc:
+            log.warning("Could not load route rules file %s: %s", path, exc)
+        return rules
+
+    def _route_rule_action(self, host: str) -> str | None:
+        if not self._route_rules:
+            return None
+        h = host.lower().rstrip(".")
+        for pat, action in self._route_rules:
+            if pat == "*" or fnmatch(h, pat):
+                return action
+        return None
+
     @classmethod
     def _is_telegram_host(cls, host: str) -> bool:
         h = host.lower().rstrip(".")
@@ -416,6 +486,35 @@ class ProxyServer:
         if self._is_likely_telegram_target(host, port, client_proto):
             self._telegram_counters["total"] += 1
             self._telegram_counters[route] += 1
+
+    def _self_heal_relay_error(self, host: str) -> None:
+        if not self._self_heal_enabled:
+            return
+        now = time.time()
+        h = host.lower().rstrip(".")
+        bucket = self._host_relay_errors.get(h, [])
+        bucket.append(now)
+        window_start = now - float(self._self_heal_window_s)
+        bucket = [ts for ts in bucket if ts >= window_start]
+        self._host_relay_errors[h] = bucket
+        if len(bucket) < int(self._self_heal_error_threshold):
+            return
+
+        # Temporarily avoid direct retries for repeatedly failing targets.
+        self._remember_direct_failure(h, ttl=600)
+        self._auto_tune_events["host_quarantined"] += 1
+
+        # Gently reduce download parallelism to lower upstream pressure.
+        if self._download_max_parallel > 2:
+            self._download_max_parallel -= 1
+            self._auto_tune_events["download_parallel_reduced"] += 1
+            log.warning(
+                "Self-heal: reduced chunked_download_max_parallel to %d after repeated errors on %s",
+                self._download_max_parallel, h,
+            )
+
+        # Reset host window after a tune event to avoid repeated immediate tuning.
+        self._host_relay_errors[h] = []
 
     @staticmethod
     def _load_host_rules(raw) -> tuple[set[str], tuple[str, ...]]:
@@ -864,6 +963,72 @@ class ProxyServer:
             log.info("Bypass tunnel → %s:%d (matches bypass_hosts)", host, port)
             await self._do_direct_tunnel(host, port, reader, writer)
             return
+
+        rule_action = self._route_rule_action(host)
+        if rule_action == "block":
+            self._record_route_decision("rule_block", host, port, client_proto)
+            log.warning("Route rule BLOCK → %s:%d", host, port)
+            try:
+                if client_proto == "http_connect":
+                    writer.write(
+                        b"HTTP/1.1 403 Forbidden\r\n"
+                        b"Connection: close\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                else:
+                    writer.write(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")
+                await writer.drain()
+            except Exception:
+                pass
+            return
+        if rule_action == "bypass":
+            self._record_route_decision("rule_bypass_direct", host, port, client_proto)
+            await self._do_direct_tunnel(host, port, reader, writer)
+            return
+        if rule_action == "direct":
+            self._record_route_decision("rule_direct_attempt", host, port, client_proto)
+            timeout = self._adaptive_direct_timeout(
+                host, default=self._tcp_connect_timeout,
+            )
+            ok = await self._do_direct_tunnel(
+                host, port, reader, writer, timeout=timeout,
+            )
+            if ok:
+                self._record_route_decision("rule_direct_ok", host, port, client_proto)
+                self._remember_direct_success(host)
+                return
+            self._remember_direct_failure(host, ttl=300)
+            self._record_route_decision("rule_direct_failed_fallback", host, port, client_proto)
+        elif rule_action == "relay":
+            self._record_route_decision("rule_force_relay", host, port, client_proto)
+            if port == 443:
+                await self._do_mitm_connect(host, port, reader, writer)
+            elif port == 80:
+                await self._do_plain_http_tunnel(host, port, reader, writer)
+            else:
+                # Non-http port cannot be relay'd; keep direct tunnel fallback.
+                await self._do_direct_tunnel(host, port, reader, writer)
+            return
+
+        # Telegram domain/direct preference in telegram_desktop_mode.
+        if (
+            self._telegram_desktop_mode
+            and self._is_telegram_host(host)
+            and not _is_ip_literal(host)
+        ):
+            self._record_route_decision("telegram_domain_direct_attempt", host, port, client_proto)
+            timeout = self._adaptive_direct_timeout(
+                host, default=self._tcp_connect_timeout, telegram_hint=True,
+            )
+            ok = await self._do_direct_tunnel(
+                host, port, reader, writer, timeout=timeout,
+            )
+            if ok:
+                self._record_route_decision("telegram_domain_direct_ok", host, port, client_proto)
+                self._remember_direct_success(host)
+                return
+            self._record_route_decision("telegram_domain_direct_failed_fallback", host, port, client_proto)
+            self._remember_direct_failure(host, ttl=300)
 
         # ── IP-literal destinations ───────────────────────────────
         # Prefer a direct tunnel first (works for unblocked IPs and keeps
@@ -1537,6 +1702,7 @@ class ProxyServer:
                     try:
                         response = await self._relay_smart(method, url, headers, body)
                     except Exception as e:
+                        self._self_heal_relay_error(host)
                         log.error("Relay error (%s): %s", url[:60], e)
                         relay_error_name = type(e).__name__
                         err_body = f"Relay error: {e}".encode()
@@ -1793,7 +1959,17 @@ class ProxyServer:
                 cache_hit = True
 
         if response is None:
-            response = await self._relay_smart(method, url, headers, body)
+            try:
+                response = await self._relay_smart(method, url, headers, body)
+            except Exception as exc:
+                self._self_heal_relay_error((urlparse(url).hostname or "unknown"))
+                err_body = f"Relay error: {exc}".encode()
+                response = (
+                    b"HTTP/1.1 502 Bad Gateway\r\n"
+                    b"Content-Type: text/plain\r\n"
+                    b"Content-Length: " + str(len(err_body)).encode() + b"\r\n"
+                    b"\r\n" + err_body
+                )
             # Cache successful GET
             if self._cache_allowed(method, url, headers, body) and response:
                 ttl = ResponseCache.parse_ttl(response, url)
@@ -1844,6 +2020,24 @@ class ProxyServer:
             cache_hit=cache_hit,
             error_name=error_name,
         )
+        if self._telemetry_jsonl_writer is not None:
+            event = {
+                "ts": int(time.time()),
+                "host": host,
+                "path": path,
+                "method": method.upper(),
+                "status": status,
+                "latency_ms": round(latency_ms, 2),
+                "req_bytes": max(0, int(request_bytes)),
+                "resp_bytes": len(body),
+                "route": route,
+                "cache_hit": bool(cache_hit),
+                "error_name": error_name or "",
+            }
+            try:
+                await self._telemetry_jsonl_writer.write(event)
+            except Exception as exc:
+                log.debug("telemetry jsonl write failed: %s", exc)
 
     async def _on_admin_client(self, reader: asyncio.StreamReader,
                                writer: asyncio.StreamWriter):
@@ -1919,6 +2113,15 @@ class ProxyServer:
                 snap["telegram"] = {
                     "mode_enabled": self._telegram_desktop_mode,
                     "stats": dict(self._telegram_counters),
+                }
+                snap["self_heal"] = {
+                    "enabled": self._self_heal_enabled,
+                    "events": dict(self._auto_tune_events),
+                    "download_max_parallel": self._download_max_parallel,
+                }
+                snap["route_rules"] = {
+                    "file": self._route_rules_file,
+                    "count": len(self._route_rules),
                 }
                 writer.write(TelemetryStore.json_response(snap))
                 await writer.drain()
