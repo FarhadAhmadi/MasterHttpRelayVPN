@@ -73,6 +73,27 @@ def parse_args():
         help="Disable the built-in SOCKS5 listener.",
     )
     parser.add_argument(
+        "--admin-port",
+        type=int,
+        default=None,
+        help="Override admin dashboard/API port (env: DFT_ADMIN_PORT).",
+    )
+    parser.add_argument(
+        "--disable-admin",
+        action="store_true",
+        help="Disable the built-in admin dashboard/API listener.",
+    )
+    parser.add_argument(
+        "--telegram-desktop-mode",
+        action="store_true",
+        help="Enable Telegram Desktop compatibility mode for SOCKS IP-literal handling.",
+    )
+    parser.add_argument(
+        "--telegram-profile",
+        action="store_true",
+        help="Apply recommended Telegram Desktop settings to config and exit.",
+    )
+    parser.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         default=None,
@@ -99,6 +120,35 @@ def parse_args():
         help="Scan Google IPs to find the fastest reachable one and exit.",
     )
     return parser.parse_args()
+
+
+def _apply_telegram_profile(config: dict) -> dict:
+    """Apply a practical local-only Telegram profile.
+
+    Returns updated config.
+    """
+    config["listen_host"] = "127.0.0.1"
+    config["listen_port"] = int(config.get("listen_port", 8085) or 8085)
+    config["socks5_enabled"] = True
+    config["socks5_port"] = int(config.get("socks5_port", 1080) or 1080)
+    config["telegram_desktop_mode"] = True
+    config["lan_sharing"] = False
+    config["admin_enabled"] = True
+    config["admin_host"] = "127.0.0.1"
+    config["admin_port"] = int(config.get("admin_port", 9090) or 9090)
+
+    # Telemetry defaults: safe-by-default with useful debugging.
+    config["metrics_redact_query"] = True
+    config["metrics_hash_hosts"] = False
+    config["metrics_include_recent_paths"] = False
+    config["metrics_bucket_seconds"] = 30
+    config["metrics_max_buckets"] = 240
+    config["metrics_max_recent_events"] = 4000
+
+    config["proxy_auth_enabled"] = False
+    config["proxy_username"] = ""
+    config["proxy_password"] = ""
+    return config
 
 
 def main():
@@ -139,6 +189,19 @@ def main():
         print(f"Invalid JSON in config: {e}")
         sys.exit(1)
 
+    if args.telegram_profile:
+        config = _apply_telegram_profile(config)
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+            f.write("\n")
+        print(f"Telegram profile applied and saved to: {config_path}")
+        print("Recommended Telegram settings:")
+        print("  HTTP proxy : 127.0.0.1:%d" % int(config["listen_port"]))
+        print("  SOCKS5     : 127.0.0.1:%d" % int(config["socks5_port"]))
+        print("  Proxy auth : disabled (proxy_auth_enabled=false)")
+        print("Now run: python main.py")
+        return
+
     # Environment variable overrides
     if os.environ.get("DFT_AUTH_KEY"):
         config["auth_key"] = os.environ["DFT_AUTH_KEY"]
@@ -163,6 +226,25 @@ def main():
 
     if args.disable_socks5:
         config["socks5_enabled"] = False
+
+    if args.admin_port is not None:
+        config["admin_port"] = args.admin_port
+    elif os.environ.get("DFT_ADMIN_PORT"):
+        config["admin_port"] = int(os.environ["DFT_ADMIN_PORT"])
+
+    if args.disable_admin:
+        config["admin_enabled"] = False
+    elif os.environ.get("DFT_ADMIN_ENABLED") is not None:
+        config["admin_enabled"] = os.environ["DFT_ADMIN_ENABLED"].strip() not in (
+            "0", "false", "False", "no", "NO"
+        )
+
+    if args.telegram_desktop_mode:
+        config["telegram_desktop_mode"] = True
+    elif os.environ.get("DFT_TELEGRAM_DESKTOP_MODE") is not None:
+        config["telegram_desktop_mode"] = os.environ["DFT_TELEGRAM_DESKTOP_MODE"].strip() not in (
+            "0", "false", "False", "no", "NO"
+        )
 
     if args.log_level is not None:
         config["log_level"] = args.log_level

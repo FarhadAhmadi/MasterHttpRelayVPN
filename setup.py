@@ -69,6 +69,29 @@ def random_auth_key(length: int = 32) -> str:
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
+def apply_telegram_quick_profile(cfg: dict) -> dict:
+    """Apply a secure local-only profile tuned for Telegram Desktop."""
+    cfg["listen_host"] = "127.0.0.1"
+    cfg["listen_port"] = int(cfg.get("listen_port", 8085) or 8085)
+    cfg["socks5_enabled"] = True
+    cfg["socks5_port"] = int(cfg.get("socks5_port", 1080) or 1080)
+    cfg["telegram_desktop_mode"] = True
+    cfg["lan_sharing"] = False
+    cfg["proxy_auth_enabled"] = False
+    cfg["proxy_username"] = ""
+    cfg["proxy_password"] = ""
+    cfg["admin_enabled"] = True
+    cfg["admin_host"] = "127.0.0.1"
+    cfg["admin_port"] = int(cfg.get("admin_port", 9090) or 9090)
+    cfg["metrics_redact_query"] = True
+    cfg["metrics_hash_hosts"] = False
+    cfg["metrics_include_recent_paths"] = False
+    cfg["metrics_bucket_seconds"] = 30
+    cfg["metrics_max_buckets"] = 240
+    cfg["metrics_max_recent_events"] = 4000
+    return cfg
+
+
 def load_base_config() -> dict:
     if EXAMPLE_PATH.exists():
         try:
@@ -151,6 +174,60 @@ def configure_network(cfg: dict) -> dict:
             cfg["socks5_port"] = int(sport)
         except ValueError:
             cfg["socks5_port"] = 1080
+    cfg["telegram_desktop_mode"] = prompt_yes_no(
+        "Enable Telegram Desktop compatibility mode?",
+        default=bool(cfg.get("telegram_desktop_mode", True)),
+    )
+
+    proxy_auth = prompt_yes_no(
+        "Enable proxy authentication (HTTP + SOCKS5)?",
+        default=bool(cfg.get("proxy_auth_enabled", False)),
+    )
+    cfg["proxy_auth_enabled"] = proxy_auth
+    if proxy_auth:
+        cfg["proxy_username"] = prompt(
+            "Proxy username",
+            default=str(cfg.get("proxy_username", "user")),
+        )
+        cfg["proxy_password"] = prompt(
+            "Proxy password",
+            default=str(cfg.get("proxy_password", random_auth_key(16))),
+        )
+    else:
+        cfg["proxy_username"] = ""
+        cfg["proxy_password"] = ""
+
+    print()
+    print(bold("Admin dashboard and metrics"))
+    admin_enabled = prompt_yes_no(
+        "Enable local admin dashboard/API on localhost?",
+        default=bool(cfg.get("admin_enabled", True)),
+    )
+    cfg["admin_enabled"] = admin_enabled
+    if admin_enabled:
+        aport = prompt("Admin port", default=str(cfg.get("admin_port", 9090)))
+        try:
+            cfg["admin_port"] = int(aport)
+        except ValueError:
+            cfg["admin_port"] = 9090
+        cfg["admin_host"] = cfg.get("admin_host", "127.0.0.1")
+        cfg["metrics_redact_query"] = prompt_yes_no(
+            "Redact query strings in metrics?",
+            default=bool(cfg.get("metrics_redact_query", True)),
+        )
+        cfg["metrics_hash_hosts"] = prompt_yes_no(
+            "Hash host names in metrics (privacy mode)?",
+            default=bool(cfg.get("metrics_hash_hosts", False)),
+        )
+        cfg["metrics_include_recent_paths"] = prompt_yes_no(
+            "Include paths in recent request list?",
+            default=bool(cfg.get("metrics_include_recent_paths", False)),
+        )
+        cfg["metrics_max_recent_events"] = int(cfg.get("metrics_max_recent_events", 2000))
+        cfg["metrics_bucket_seconds"] = int(cfg.get("metrics_bucket_seconds", 60))
+        cfg["metrics_max_buckets"] = int(cfg.get("metrics_max_buckets", 180))
+    else:
+        cfg["admin_enabled"] = False
     return cfg
 
 
@@ -176,6 +253,10 @@ def main() -> int:
 
     cfg = load_base_config()
     cfg["mode"] = "apps_script"
+
+    if prompt_yes_no("Apply Telegram quick profile defaults?", default=True):
+        cfg = apply_telegram_quick_profile(cfg)
+        print(green("  Telegram quick profile applied (you can still change values below)."))
 
     suggested_key = random_auth_key()
     print()

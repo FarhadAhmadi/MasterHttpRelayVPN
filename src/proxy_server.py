@@ -7,12 +7,15 @@ as JSON to script.google.com fronted through www.google.com).
 """
 
 import asyncio
+import base64
+import hmac
 import logging
 import re
 import socket
 import ssl
 import time
 import ipaddress
+from collections import Counter
 from urllib.parse import urlparse
 
 try:
@@ -42,6 +45,7 @@ from constants import (
     UNCACHEABLE_HEADER_NAMES,
 )
 from domain_fronter import DomainFronter
+from telemetry import TelemetryStore
 
 log = logging.getLogger("Proxy")
 
@@ -177,6 +181,13 @@ class ProxyServer:
         "video/",
         "audio/",
     )
+    _TELEGRAM_SUFFIXES = (
+        "telegram.org",
+        "telegram.me",
+        "t.me",
+        "telegra.ph",
+        "tdesktop.com",
+    )
 
     def __init__(self, config: dict):
         self.host = config.get("listen_host", "127.0.0.1")
@@ -195,8 +206,35 @@ class ProxyServer:
         self.mitm = None
         self._cache = ResponseCache(max_mb=CACHE_MAX_MB)
         self._direct_fail_until: dict[str, float] = {}
+        self._direct_fail_score: dict[str, int] = {}
         self._servers: list[asyncio.base_events.Server] = []
         self._client_tasks: set[asyncio.Task] = set()
+        self._route_decisions: Counter[str] = Counter()
+        self._telegram_counters: Counter[str] = Counter()
+        self._telemetry = TelemetryStore(
+            max_recent_events=self._cfg_int(
+                config, "metrics_max_recent_events", 2000, minimum=200,
+            ),
+            hash_hosts=bool(config.get("metrics_hash_hosts", False)),
+            redact_query=bool(config.get("metrics_redact_query", True)),
+            include_recent_paths=bool(config.get("metrics_include_recent_paths", False)),
+            bucket_seconds=self._cfg_int(
+                config, "metrics_bucket_seconds", 60, minimum=10,
+            ),
+            max_buckets=self._cfg_int(
+                config, "metrics_max_buckets", 180, minimum=10,
+            ),
+        )
+        self._admin_enabled = bool(config.get("admin_enabled", True))
+        self._admin_host = str(config.get("admin_host", "127.0.0.1"))
+        self._admin_port = self._cfg_int(
+            config, "admin_port", 9090, minimum=1,
+        )
+        self._admin_token = str(config.get("admin_token", "")).strip()
+        self._proxy_auth_enabled = bool(config.get("proxy_auth_enabled", False))
+        self._proxy_username = str(config.get("proxy_username", ""))
+        self._proxy_password = str(config.get("proxy_password", ""))
+        self._telegram_desktop_mode = bool(config.get("telegram_desktop_mode", False))
         self._tcp_connect_timeout = self._cfg_float(
             config, "tcp_connect_timeout", TCP_CONNECT_TIMEOUT, minimum=1.0,
         )
@@ -260,6 +298,12 @@ class ProxyServer:
         else:
             self._SNI_REWRITE_SUFFIXES = SNI_REWRITE_SUFFIXES
 
+        if self._telegram_desktop_mode:
+            log.info(
+                "telegram_desktop_mode enabled — SOCKS IP-literal flows fail fast "
+                "on blocked DCs so Telegram can rotate endpoints quicker"
+            )
+
         try:
             from mitm import MITMCertManager
             self.mitm = MITMCertManager()
@@ -318,6 +362,60 @@ class ProxyServer:
     def _untrack_task(self, task: asyncio.Task | None) -> None:
         if task is not None:
             self._client_tasks.discard(task)
+
+    @staticmethod
+    def _parse_headers_from_block(header_block: bytes) -> dict[str, str]:
+        headers = {}
+        for raw_line in header_block.split(b"\r\n")[1:]:
+            if b":" in raw_line:
+                k, v = raw_line.decode(errors="replace").split(":", 1)
+                headers[k.strip()] = v.strip()
+        return headers
+
+    def _http_proxy_auth_ok(self, headers: dict[str, str]) -> bool:
+        if not self._proxy_auth_enabled:
+            return True
+        if not self._proxy_username and not self._proxy_password:
+            return True
+        auth = self._header_value(headers, "proxy-authorization")
+        if not auth.lower().startswith("basic "):
+            return False
+        token = auth.split(" ", 1)[1].strip()
+        try:
+            raw = base64.b64decode(token).decode(errors="replace")
+        except Exception:
+            return False
+        supplied_user, sep, supplied_pass = raw.partition(":")
+        if not sep:
+            return False
+        return (
+            hmac.compare_digest(supplied_user, self._proxy_username)
+            and hmac.compare_digest(supplied_pass, self._proxy_password)
+        )
+
+    @classmethod
+    def _is_telegram_host(cls, host: str) -> bool:
+        h = host.lower().rstrip(".")
+        if not h:
+            return False
+        if "telegram" in h:
+            return True
+        return any(h == suffix or h.endswith("." + suffix) for suffix in cls._TELEGRAM_SUFFIXES)
+
+    @classmethod
+    def _is_likely_telegram_target(cls, host: str, port: int, client_proto: str) -> bool:
+        if cls._is_telegram_host(host):
+            return True
+        if client_proto == "socks5" and port == 443 and _is_ip_literal(host):
+            return True
+        return False
+
+    def _record_route_decision(self, route: str, host: str, port: int,
+                               client_proto: str) -> None:
+        self._route_decisions[route] += 1
+        if self._is_likely_telegram_target(host, port, client_proto):
+            self._telegram_counters["total"] += 1
+            self._telegram_counters[route] += 1
 
     @staticmethod
     def _load_host_rules(raw) -> tuple[set[str], tuple[str, ...]]:
@@ -451,6 +549,7 @@ class ProxyServer:
     async def start(self):
         http_srv = await asyncio.start_server(self._on_client, self.host, self.port)
         socks_srv = None
+        admin_srv = None
 
         if self.socks_enabled:
             try:
@@ -461,7 +560,16 @@ class ProxyServer:
                 log.error("SOCKS5 listener failed on %s:%d: %s",
                           self.socks_host, self.socks_port, e)
 
-        self._servers = [s for s in (http_srv, socks_srv) if s]
+        if self._admin_enabled:
+            try:
+                admin_srv = await asyncio.start_server(
+                    self._on_admin_client, self._admin_host, self._admin_port
+                )
+            except OSError as e:
+                log.error("Admin listener failed on %s:%d: %s",
+                          self._admin_host, self._admin_port, e)
+
+        self._servers = [s for s in (http_srv, socks_srv, admin_srv) if s]
 
         log.info(
             "HTTP proxy listening on %s:%d",
@@ -472,14 +580,33 @@ class ProxyServer:
                 "SOCKS5 proxy listening on %s:%d",
                 self.socks_host, self.socks_port,
             )
+        if admin_srv:
+            log.info(
+                "Admin dashboard listening on http://%s:%d",
+                self._admin_host, self._admin_port,
+            )
 
         try:
             async with http_srv:
                 if socks_srv:
-                    async with socks_srv:
+                    if admin_srv:
+                        async with socks_srv, admin_srv:
+                            await asyncio.gather(
+                                http_srv.serve_forever(),
+                                socks_srv.serve_forever(),
+                                admin_srv.serve_forever(),
+                            )
+                    else:
+                        async with socks_srv:
+                            await asyncio.gather(
+                                http_srv.serve_forever(),
+                                socks_srv.serve_forever(),
+                            )
+                elif admin_srv:
+                    async with admin_srv:
                         await asyncio.gather(
                             http_srv.serve_forever(),
-                            socks_srv.serve_forever(),
+                            admin_srv.serve_forever(),
                         )
                 else:
                     await http_srv.serve_forever()
@@ -550,6 +677,16 @@ class ProxyServer:
                 return
 
             method = parts[0].upper()
+            headers = self._parse_headers_from_block(header_block)
+            if not self._http_proxy_auth_ok(headers):
+                writer.write(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+                    b"Proxy-Authenticate: Basic realm=\"MasterHttpRelayVPN\"\r\n"
+                    b"Connection: close\r\n"
+                    b"Content-Length: 0\r\n\r\n"
+                )
+                await writer.drain()
+                return
 
             if method == "CONNECT":
                 await self._do_connect(parts[1], reader, writer)
@@ -581,13 +718,44 @@ class ProxyServer:
                 return
 
             methods = await asyncio.wait_for(reader.readexactly(nmethods), timeout=10)
-            if 0x00 not in methods:
-                writer.write(b"\x05\xff")
+            if self._proxy_auth_enabled and (self._proxy_username or self._proxy_password):
+                if 0x02 not in methods:
+                    writer.write(b"\x05\xff")
+                    await writer.drain()
+                    return
+                # Username/password auth required
+                writer.write(b"\x05\x02")
                 await writer.drain()
-                return
-
-            writer.write(b"\x05\x00")
-            await writer.drain()
+                auth_ver = await asyncio.wait_for(reader.readexactly(1), timeout=10)
+                if auth_ver != b"\x01":
+                    writer.write(b"\x01\x01")
+                    await writer.drain()
+                    return
+                ulen = (await asyncio.wait_for(reader.readexactly(1), timeout=10))[0]
+                uname = (await asyncio.wait_for(reader.readexactly(ulen), timeout=10)).decode(
+                    errors="replace"
+                )
+                plen = (await asyncio.wait_for(reader.readexactly(1), timeout=10))[0]
+                passwd = (await asyncio.wait_for(reader.readexactly(plen), timeout=10)).decode(
+                    errors="replace"
+                )
+                if (
+                    hmac.compare_digest(uname, self._proxy_username)
+                    and hmac.compare_digest(passwd, self._proxy_password)
+                ):
+                    writer.write(b"\x01\x00")
+                    await writer.drain()
+                else:
+                    writer.write(b"\x01\x01")
+                    await writer.drain()
+                    return
+            else:
+                if 0x00 not in methods:
+                    writer.write(b"\x05\xff")
+                    await writer.drain()
+                    return
+                writer.write(b"\x05\x00")
+                await writer.drain()
 
             req = await asyncio.wait_for(reader.readexactly(4), timeout=15)
             ver, cmd, _rsv, atyp = req
@@ -616,10 +784,7 @@ class ProxyServer:
             port = int.from_bytes(port_raw, "big")
 
             log.info("SOCKS5 CONNECT → %s:%d", host, port)
-
-            writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
-            await writer.drain()
-            await self._handle_target_tunnel(host, port, reader, writer)
+            await self._handle_socks_target_tunnel(host, port, reader, writer)
 
         except asyncio.IncompleteReadError:
             pass
@@ -653,26 +818,49 @@ class ProxyServer:
 
         log.info("CONNECT → %s:%d", host, port)
 
+        await self._handle_http_connect_tunnel(host, port, reader, writer)
+
+    async def _handle_http_connect_tunnel(self, host: str, port: int,
+                                          reader: asyncio.StreamReader,
+                                          writer: asyncio.StreamWriter):
+        if self._is_blocked(host):
+            log.warning("BLOCKED → %s:%d (matches block_hosts)", host, port)
+            writer.write(
+                b"HTTP/1.1 403 Forbidden\r\n"
+                b"Connection: close\r\n"
+                b"Content-Length: 0\r\n\r\n"
+            )
+            await writer.drain()
+            return
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
+        await self._handle_target_tunnel(
+            host, port, reader, writer, client_proto="http_connect",
+        )
 
-        await self._handle_target_tunnel(host, port, reader, writer)
+    async def _handle_socks_target_tunnel(self, host: str, port: int,
+                                          reader: asyncio.StreamReader,
+                                          writer: asyncio.StreamWriter):
+        if self._is_blocked(host):
+            log.warning("SOCKS5 BLOCKED → %s:%d (matches block_hosts)", host, port)
+            writer.write(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")
+            await writer.drain()
+            return
+        writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+        await writer.drain()
+        await self._handle_target_tunnel(
+            host, port, reader, writer, client_proto="socks5",
+        )
 
     async def _handle_target_tunnel(self, host: str, port: int,
                                     reader: asyncio.StreamReader,
-                                    writer: asyncio.StreamWriter):
+                                    writer: asyncio.StreamWriter,
+                                    *,
+                                    client_proto: str = "http_connect"):
         """Route a target connection through the Apps Script relay."""
-        # ── Block / bypass policy ─────────────────────────────────
-        if self._is_blocked(host):
-            log.warning("BLOCKED → %s:%d (matches block_hosts)", host, port)
-            try:
-                writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
-                await writer.drain()
-            except Exception:
-                pass
-            return
-
+        # ── Bypass policy ─────────────────────────────────────────
         if self._is_bypassed(host):
+            self._record_route_decision("bypass_direct", host, port, client_proto)
             log.info("Bypass tunnel → %s:%d (matches bypass_hosts)", host, port)
             await self._do_direct_tunnel(host, port, reader, writer)
             return
@@ -691,13 +879,20 @@ class ProxyServer:
         # connects skip the doomed direct attempt.
         if _is_ip_literal(host):
             if not self._direct_temporarily_disabled(host):
+                self._record_route_decision("direct_ip_attempt", host, port, client_proto)
                 log.info("Direct tunnel → %s:%d (IP literal)", host, port)
+                timeout = self._adaptive_direct_timeout(
+                    host, default=4.0, telegram_hint=True,
+                )
                 ok = await self._do_direct_tunnel(
-                    host, port, reader, writer, timeout=4.0,
+                    host, port, reader, writer, timeout=timeout,
                 )
                 if ok:
+                    self._record_route_decision("direct_ip_ok", host, port, client_proto)
+                    self._remember_direct_success(host)
                     return
                 self._remember_direct_failure(host, ttl=300)
+                self._record_route_decision("direct_ip_failed", host, port, client_proto)
                 if port not in (80, 443):
                     log.warning("Direct tunnel failed for %s:%d", host, port)
                     return
@@ -710,9 +905,19 @@ class ProxyServer:
                     "Relay fallback → %s:%d (direct temporarily disabled)",
                     host, port,
                 )
+            if self._telegram_desktop_mode and client_proto == "socks5":
+                self._record_route_decision("tg_failfast_ip_socks", host, port, client_proto)
+                log.info(
+                    "Telegram desktop mode: skipping MITM/relay fallback for "
+                    "SOCKS5 IP-literal %s:%d to force fast DC rotation",
+                    host, port,
+                )
+                return
             if port == 443:
+                self._record_route_decision("ip_fallback_mitm", host, port, client_proto)
                 await self._do_mitm_connect(host, port, reader, writer)
             elif port == 80:
+                self._record_route_decision("ip_fallback_plain_http", host, port, client_proto)
                 await self._do_plain_http_tunnel(host, port, reader, writer)
             return
 
@@ -721,12 +926,14 @@ class ProxyServer:
             # SNI-blocked domain: MITM-decrypt from browser, then
             # re-connect to the override IP with SNI=front_domain so
             # the ISP never sees the blocked hostname in the TLS handshake.
+            self._record_route_decision("sni_rewrite_tunnel", host, port, client_proto)
             log.info("SNI-rewrite tunnel → %s via %s (SNI: %s)",
                      host, override_ip, self.fronter.sni_host)
             await self._do_sni_rewrite_tunnel(host, port, reader, writer,
                                               connect_ip=override_ip)
         elif self._is_google_domain(host):
             if self._direct_temporarily_disabled(host):
+                self._record_route_decision("google_direct_disabled_fallback", host, port, client_proto)
                 log.info("Relay fallback → %s (direct tunnel temporarily disabled)", host)
                 if port == 443:
                     await self._do_mitm_connect(host, port, reader, writer)
@@ -734,28 +941,49 @@ class ProxyServer:
                     await self._do_plain_http_tunnel(host, port, reader, writer)
                 return
 
+            self._record_route_decision("google_direct_attempt", host, port, client_proto)
             log.info("Direct tunnel → %s (Google domain, skipping relay)", host)
-            ok = await self._do_direct_tunnel(host, port, reader, writer)
+            timeout = self._adaptive_direct_timeout(
+                host, default=self._tcp_connect_timeout,
+            )
+            ok = await self._do_direct_tunnel(
+                host, port, reader, writer, timeout=timeout,
+            )
             if ok:
+                self._record_route_decision("google_direct_ok", host, port, client_proto)
+                self._remember_direct_success(host)
                 return
 
             self._remember_direct_failure(host)
+            self._record_route_decision("google_direct_failed_fallback", host, port, client_proto)
             log.warning("Direct tunnel fallback → %s (switching to relay)", host)
             if port == 443:
                 await self._do_mitm_connect(host, port, reader, writer)
             else:
                 await self._do_plain_http_tunnel(host, port, reader, writer)
         elif port == 443:
+            self._record_route_decision("mitm_relay", host, port, client_proto)
             await self._do_mitm_connect(host, port, reader, writer)
         elif port == 80:
+            self._record_route_decision("plain_http_relay", host, port, client_proto)
             await self._do_plain_http_tunnel(host, port, reader, writer)
         else:
             # Non-HTTP port (e.g. mtalk:5228 XMPP, IMAP, SMTP, SSH) —
             # payload isn't HTTP, so we can't relay or MITM. Tunnel bytes.
+            self._record_route_decision("direct_non_http_attempt", host, port, client_proto)
             log.info("Direct tunnel → %s:%d (non-HTTP port)", host, port)
-            ok = await self._do_direct_tunnel(host, port, reader, writer)
+            timeout = self._adaptive_direct_timeout(
+                host, default=self._tcp_connect_timeout,
+            )
+            ok = await self._do_direct_tunnel(
+                host, port, reader, writer, timeout=timeout,
+            )
             if not ok:
+                self._record_route_decision("direct_non_http_failed", host, port, client_proto)
                 log.warning("Direct tunnel failed for %s:%d", host, port)
+            else:
+                self._record_route_decision("direct_non_http_ok", host, port, client_proto)
+                self._remember_direct_success(host)
 
     # ── Hosts override (fake DNS) ─────────────────────────────────
 
@@ -863,9 +1091,36 @@ class ProxyServer:
         return disabled
 
     def _remember_direct_failure(self, host: str, ttl: int = 600):
-        until = time.time() + ttl
-        for key in self._direct_failure_keys(host.lower().rstrip(".")):
+        normalized = host.lower().rstrip(".")
+        score = min(6, self._direct_fail_score.get(normalized, 0) + 1)
+        self._direct_fail_score[normalized] = score
+        adaptive_ttl = int(max(60, min(1800, ttl * (1.35 ** (score - 1)))))
+        until = time.time() + adaptive_ttl
+        for key in self._direct_failure_keys(normalized):
             self._direct_fail_until[key] = until
+
+    def _remember_direct_success(self, host: str) -> None:
+        normalized = host.lower().rstrip(".")
+        score = self._direct_fail_score.get(normalized, 0)
+        if score > 1:
+            self._direct_fail_score[normalized] = score - 1
+        elif score == 1:
+            self._direct_fail_score.pop(normalized, None)
+
+    def _adaptive_direct_timeout(self, host: str, *, default: float,
+                                 telegram_hint: bool = False) -> float:
+        normalized = host.lower().rstrip(".")
+        score = self._direct_fail_score.get(normalized, 0)
+        timeout = float(default)
+        if score >= 3:
+            timeout = max(1.5, timeout * 0.55)
+        elif score == 2:
+            timeout = max(2.0, timeout * 0.70)
+        elif score == 1:
+            timeout = max(2.5, timeout * 0.85)
+        if telegram_hint:
+            timeout = min(timeout, 3.5)
+        return timeout
 
     def _direct_failure_keys(self, host: str) -> tuple[str, ...]:
         keys = [host]
@@ -1191,6 +1446,7 @@ class ProxyServer:
 
                 method = parts[0]
                 path = parts[1]
+                req_size = len(header_block) + len(body)
 
                 # Parse headers
                 headers = {}
@@ -1234,21 +1490,47 @@ class ProxyServer:
                         "CORS preflight → %s (responding locally)",
                         url[:60],
                     )
-                    writer.write(self._cors_preflight_response(
+                    response = self._cors_preflight_response(
                         origin, acr_method, acr_headers,
-                    ))
+                    )
+                    writer.write(response)
                     await writer.drain()
+                    await self._record_telemetry(
+                        method=method,
+                        url=url,
+                        request_bytes=req_size,
+                        response=response,
+                        started_at=time.perf_counter(),
+                        route="cors_preflight",
+                        cache_hit=False,
+                        error_name="",
+                    )
                     continue
 
+                started_at = time.perf_counter()
                 if await self._maybe_stream_download(method, url, headers, body, writer):
+                    await self._record_telemetry(
+                        method=method,
+                        url=url,
+                        request_bytes=req_size,
+                        response=b"",
+                        started_at=started_at,
+                        route="stream_parallel",
+                        cache_hit=False,
+                        error_name="",
+                        status_override=200,
+                    )
                     continue
 
                 # Check local cache first (GET only)
                 response = None
+                cache_hit = False
+                relay_error_name = ""
                 if self._cache_allowed(method, url, headers, body):
                     response = self._cache.get(url)
                     if response:
                         log.debug("Cache HIT: %s", url[:60])
+                        cache_hit = True
 
                 if response is None:
                     # Relay through Apps Script
@@ -1256,6 +1538,7 @@ class ProxyServer:
                         response = await self._relay_smart(method, url, headers, body)
                     except Exception as e:
                         log.error("Relay error (%s): %s", url[:60], e)
+                        relay_error_name = type(e).__name__
                         err_body = f"Relay error: {e}".encode()
                         response = (
                             b"HTTP/1.1 502 Bad Gateway\r\n"
@@ -1282,6 +1565,16 @@ class ProxyServer:
 
                 writer.write(response)
                 await writer.drain()
+                await self._record_telemetry(
+                    method=method,
+                    url=url,
+                    request_bytes=req_size,
+                    response=response,
+                    started_at=started_at,
+                    route="relay",
+                    cache_hit=cache_hit,
+                    error_name=relay_error_name,
+                )
 
             except asyncio.TimeoutError:
                 break
@@ -1421,6 +1714,7 @@ class ProxyServer:
 
     async def _do_http(self, header_block: bytes, reader, writer):
         body = b""
+        started_at = time.perf_counter()
         if _has_unsupported_transfer_encoding(header_block):
             log.warning("Unsupported Transfer-Encoding on plain HTTP request")
             writer.write(
@@ -1458,21 +1752,45 @@ class ProxyServer:
         acr_headers = self._header_value(headers, "access-control-request-headers")
         if method.upper() == "OPTIONS" and acr_method:
             log.debug("CORS preflight (HTTP) → %s (responding locally)", url[:60])
-            writer.write(self._cors_preflight_response(
+            response = self._cors_preflight_response(
                 origin, acr_method, acr_headers,
-            ))
+            )
+            writer.write(response)
             await writer.drain()
+            await self._record_telemetry(
+                method=method,
+                url=url,
+                request_bytes=len(header_block) + len(body),
+                response=response,
+                started_at=started_at,
+                route="cors_preflight",
+                cache_hit=False,
+                error_name="",
+            )
             return
 
         if await self._maybe_stream_download(method, url, headers, body, writer):
+            await self._record_telemetry(
+                method=method,
+                url=url,
+                request_bytes=len(header_block) + len(body),
+                response=b"",
+                started_at=started_at,
+                route="stream_parallel",
+                cache_hit=False,
+                error_name="",
+                status_override=200,
+            )
             return
 
         # Cache check for GET
         response = None
+        cache_hit = False
         if self._cache_allowed(method, url, headers, body):
             response = self._cache.get(url)
             if response:
                 log.debug("Cache HIT (HTTP): %s", url[:60])
+                cache_hit = True
 
         if response is None:
             response = await self._relay_smart(method, url, headers, body)
@@ -1489,3 +1807,322 @@ class ProxyServer:
 
         writer.write(response)
         await writer.drain()
+        await self._record_telemetry(
+            method=method,
+            url=url,
+            request_bytes=len(header_block) + len(body),
+            response=response,
+            started_at=started_at,
+            route="relay",
+            cache_hit=cache_hit,
+            error_name="",
+        )
+
+    async def _record_telemetry(self, *, method: str, url: str,
+                                request_bytes: int, response: bytes,
+                                started_at: float, route: str,
+                                cache_hit: bool, error_name: str,
+                                status_override: int | None = None) -> None:
+        status, _, body = self.fronter._split_raw_response(response)
+        if status_override is not None:
+            status = int(status_override)
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower() or "unknown"
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        latency_ms = (time.perf_counter() - started_at) * 1000.0
+        await self._telemetry.record_request(
+            host=host,
+            path=path,
+            method=method,
+            status=status,
+            latency_ms=latency_ms,
+            req_bytes=request_bytes,
+            resp_bytes=len(body),
+            route=route,
+            cache_hit=cache_hit,
+            error_name=error_name,
+        )
+
+    async def _on_admin_client(self, reader: asyncio.StreamReader,
+                               writer: asyncio.StreamWriter):
+        task = self._track_current_task()
+        try:
+            first = await asyncio.wait_for(reader.readline(), timeout=10)
+            if not first:
+                return
+            request_line = first.decode(errors="replace").strip()
+            parts = request_line.split(" ", 2)
+            if len(parts) < 2:
+                return
+            method, path = parts[0].upper(), parts[1]
+            header_block = b""
+            while True:
+                line = await asyncio.wait_for(reader.readline(), timeout=10)
+                if line in (b"\r\n", b"\n", b""):
+                    break
+                header_block += line
+                if len(header_block) > 32768:
+                    break
+            headers = {}
+            for raw_line in header_block.split(b"\r\n"):
+                if b":" in raw_line:
+                    k, v = raw_line.decode(errors="replace").split(":", 1)
+                    headers[k.strip().lower()] = v.strip()
+            content_length = 0
+            if headers.get("content-length", "").isdigit():
+                content_length = int(headers.get("content-length", "0"))
+            body_data = b""
+            if content_length > 0 and content_length <= 16384:
+                body_data = await reader.readexactly(content_length)
+
+            if method not in {"GET", "POST"}:
+                writer.write(
+                    b"HTTP/1.1 405 Method Not Allowed\r\n"
+                    b"Content-Length: 0\r\n\r\n"
+                )
+                await writer.drain()
+                return
+
+            if self._admin_token:
+                supplied = headers.get("x-admin-token", "")
+                if supplied != self._admin_token:
+                    writer.write(
+                        b"HTTP/1.1 401 Unauthorized\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
+
+            if path == "/" or path.startswith("/?"):
+                body = self._admin_html().encode()
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: text/html; charset=utf-8\r\n"
+                    b"Cache-Control: no-store\r\n"
+                    b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+                )
+                await writer.drain()
+                return
+
+            if path.startswith("/api/summary"):
+                snap = await self._telemetry.snapshot(top_hosts=30, recent_limit=150)
+                snap["relay"] = self.fronter.stats_snapshot()
+                snap["cache_store"] = {
+                    "entries": len(self._cache._store),
+                    "bytes": self._cache._size,
+                    "hits": self._cache.hits,
+                    "misses": self._cache.misses,
+                }
+                snap["route_decisions"] = dict(self._route_decisions)
+                snap["telegram"] = {
+                    "mode_enabled": self._telegram_desktop_mode,
+                    "stats": dict(self._telegram_counters),
+                }
+                writer.write(TelemetryStore.json_response(snap))
+                await writer.drain()
+                return
+
+            if path.startswith("/api/top-hosts"):
+                limit = 20
+                if "?" in path:
+                    try:
+                        q = path.split("?", 1)[1]
+                        for tok in q.split("&"):
+                            k, _, v = tok.partition("=")
+                            if k == "limit" and v.isdigit():
+                                limit = max(1, min(200, int(v)))
+                    except Exception:
+                        pass
+                snap = await self._telemetry.snapshot(top_hosts=limit, recent_limit=1)
+                writer.write(TelemetryStore.json_response({"top_hosts": snap["top_hosts"]}))
+                await writer.drain()
+                return
+
+            if path.startswith("/api/recent.csv"):
+                csv_body = await self._telemetry.recent_csv(limit=1000)
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: text/csv; charset=utf-8\r\n"
+                    b"Cache-Control: no-store\r\n"
+                    b"Content-Disposition: attachment; filename=\"mhrvpn_recent.csv\"\r\n"
+                    b"Content-Length: " + str(len(csv_body)).encode() + b"\r\n\r\n" + csv_body
+                )
+                await writer.drain()
+                return
+
+            if path.startswith("/metrics"):
+                text = await self._telemetry.prometheus_text()
+                if self._route_decisions:
+                    lines = [text.rstrip("\n")]
+                    lines.append("# TYPE mhrvpn_route_decisions_total counter")
+                    for route, count in sorted(self._route_decisions.items()):
+                        route_label = str(route).replace("\\", "_").replace('"', "_")
+                        lines.append(
+                            f'mhrvpn_route_decisions_total{{route="{route_label}"}} {count}'
+                        )
+                    if self._telegram_counters:
+                        lines.append("# TYPE mhrvpn_telegram_route_decisions_total counter")
+                        for route, count in sorted(self._telegram_counters.items()):
+                            route_label = str(route).replace("\\", "_").replace('"', "_")
+                            lines.append(
+                                f'mhrvpn_telegram_route_decisions_total{{route="{route_label}"}} {count}'
+                            )
+                    text = "\n".join(lines) + "\n"
+                data = text.encode()
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
+                    b"Cache-Control: no-store\r\n"
+                    b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n" + data
+                )
+                await writer.drain()
+                return
+
+            if path.startswith("/api/reset"):
+                if method != "POST":
+                    writer.write(
+                        b"HTTP/1.1 405 Method Not Allowed\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
+                _ = body_data
+                await self._telemetry.reset()
+                self._route_decisions.clear()
+                self._telegram_counters.clear()
+                writer.write(TelemetryStore.json_response({"ok": True, "reset": True}))
+                await writer.drain()
+                return
+
+            if path.startswith("/healthz"):
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Content-Length: 15\r\n\r\n"
+                    b"{\"status\":\"ok\"}"
+                )
+                await writer.drain()
+                return
+
+            writer.write(
+                b"HTTP/1.1 404 Not Found\r\n"
+                b"Content-Length: 0\r\n\r\n"
+            )
+            await writer.drain()
+        except Exception as exc:
+            log.debug("Admin client error: %s", exc)
+        finally:
+            self._untrack_task(task)
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _admin_html() -> str:
+        return """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MasterHttpRelayVPN Dashboard</title>
+  <style>
+    :root { --bg:#0f172a; --card:#111827; --muted:#94a3b8; --text:#e2e8f0; --good:#22c55e; --warn:#f59e0b; --bad:#ef4444; --accent:#38bdf8; }
+    body{margin:0;font-family:ui-sans-serif,system-ui,Segoe UI,Arial;background:linear-gradient(180deg,#0b1220,#0f172a);color:var(--text);}
+    .wrap{max-width:1200px;margin:0 auto;padding:18px;}
+    h1{margin:0 0 12px;font-size:22px;}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;}
+    .card{background:var(--card);border:1px solid #1f2937;border-radius:10px;padding:12px;}
+    .label{font-size:12px;color:var(--muted);}
+    .value{font-size:22px;font-weight:700;margin-top:4px;}
+    table{width:100%;border-collapse:collapse;font-size:13px;}
+    th,td{padding:7px;border-bottom:1px solid #1f2937;text-align:left;}
+    th{color:var(--muted);font-weight:600;}
+    .row{display:grid;grid-template-columns:2fr 3fr 2fr;gap:10px;margin-top:10px;}
+    .toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:10px 0;}
+    button{background:#1e293b;border:1px solid #334155;color:#e2e8f0;padding:7px 10px;border-radius:8px;cursor:pointer}
+    button:hover{background:#273449}
+    input{background:#0b1220;border:1px solid #334155;color:#e2e8f0;padding:7px 10px;border-radius:8px}
+    .mono{font-family:ui-monospace,Consolas,monospace;}
+    a{color:var(--accent)}
+    @media(max-width:1100px){.row{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>MasterHttpRelayVPN Dashboard</h1>
+    <div class="grid" id="cards"></div>
+    <div class="card" style="margin-top:10px">
+      <h3 style="margin-top:0">Traffic (rolling)</h3>
+      <svg id="chart" viewBox="0 0 900 170" style="width:100%;height:170px;background:#0b1220;border-radius:8px"></svg>
+    </div>
+    <div class="toolbar">
+      <input id="filter" placeholder="Filter host (contains)..." />
+      <button onclick="downloadCsv()">Download CSV</button>
+      <button onclick="resetStats()">Reset Stats</button>
+      <span class="label">CSV endpoint: <a href="/api/recent.csv" target="_blank">/api/recent.csv</a></span>
+    </div>
+    <div class="row">
+      <div class="card"><h3>Top Hosts</h3><table id="hosts"></table></div>
+      <div class="card"><h3>Recent Requests</h3><table id="recent"></table></div>
+      <div class="card"><h3>Route Decisions</h3><table id="routes"></table></div>
+    </div>
+    <p class="label">Prometheus endpoint: <a href="/metrics" target="_blank">/metrics</a> · JSON: <a href="/api/summary" target="_blank">/api/summary</a></p>
+  </div>
+  <script>
+    function fbytes(n){if(!n)return "0 B";const u=["B","KB","MB","GB"];let i=0,v=n;while(v>=1024&&i<u.length-1){v/=1024;i++}return v.toFixed(i?1:0)+" "+u[i]}
+    function pct(n){return Number(n||0).toFixed(2)+"%"}
+    function linePath(vals,w,h,pad){
+      if(!vals.length)return "";
+      const max=Math.max(...vals,1), n=vals.length;
+      return vals.map((v,i)=>`${i===0?"M":"L"} ${pad + (i*(w-2*pad)/Math.max(1,n-1))} ${h-pad-(v/max)*(h-2*pad)}`).join(" ");
+    }
+    function drawChart(ts){
+      const svg=document.getElementById("chart");
+      const w=900,h=170,p=16;
+      const req=(ts||[]).map(x=>x.requests||0);
+      const down=(ts||[]).map(x=>x.resp_bytes||0);
+      const p1=linePath(req,w,h,p), p2=linePath(down,w,h,p);
+      svg.innerHTML=
+        `<path d="${p1}" fill="none" stroke="#38bdf8" stroke-width="2"/>`+
+        `<path d="${p2}" fill="none" stroke="#22c55e" stroke-width="2"/>`+
+        `<text x="${p}" y="14" fill="#94a3b8" font-size="11">blue=request count, green=download bytes</text>`;
+    }
+    async function load(){
+      const res=await fetch("/api/summary",{cache:"no-store"});
+      const d=await res.json();
+      const t=d.totals||{};
+      const tg=d.telegram?.stats||{};
+      const cards=[
+        ["Requests",t.requests||0],["Errors",t.errors||0],["Error Rate",pct(t.error_rate_pct)],
+        ["Upload",fbytes(t.req_bytes||0)],["Download",fbytes(t.resp_bytes||0)],
+        ["Uptime", (d.uptime_s||0)+"s"],["Cache Hits", (d.cache_store?.hits||0)],["Cache Misses",(d.cache_store?.misses||0)],
+        ["TG Decisions", tg.total||0]
+      ];
+      document.getElementById("cards").innerHTML=cards.map(x=>`<div class="card"><div class="label">${x[0]}</div><div class="value">${x[1]}</div></div>`).join("");
+      drawChart(d.timeseries||[]);
+      const filter=(document.getElementById("filter").value||"").toLowerCase();
+      const hosts=(d.top_hosts||[]).filter(h=>!filter||String(h.host).toLowerCase().includes(filter)).slice(0,12);
+      document.getElementById("hosts").innerHTML="<tr><th>Host</th><th>Req</th><th>Err</th><th>Down</th><th>Avg ms</th></tr>"+hosts.map(h=>`<tr><td class="mono">${h.host}</td><td>${h.requests}</td><td>${h.errors}</td><td>${fbytes(h.resp_bytes)}</td><td>${h.avg_latency_ms}</td></tr>`).join("");
+      const recent=(d.recent||[]).slice().reverse().slice(0,18);
+      document.getElementById("recent").innerHTML="<tr><th>Time</th><th>Req</th><th>Status</th><th>Route</th><th>Down</th></tr>"+recent.map(r=>`<tr><td>${new Date(r.ts*1000).toLocaleTimeString()}</td><td class="mono">${r.method} ${r.host}${r.path?(" "+r.path):""}</td><td>${r.status}</td><td>${r.route}</td><td>${fbytes(r.resp_bytes)}</td></tr>`).join("");
+      const routes=Object.entries(d.route_decisions||{}).sort((a,b)=>b[1]-a[1]).slice(0,16);
+      document.getElementById("routes").innerHTML="<tr><th>Route</th><th>Count</th></tr>"+routes.map(x=>`<tr><td class='mono'>${x[0]}</td><td>${x[1]}</td></tr>`).join("");
+    }
+    async function resetStats(){
+      if(!confirm("Reset all telemetry counters?")) return;
+      const res=await fetch("/api/reset",{method:"POST"});
+      if(!res.ok){ alert("Reset failed"); return; }
+      await load();
+    }
+    function downloadCsv(){
+      window.open("/api/recent.csv","_blank");
+    }
+    document.getElementById("filter").addEventListener("input",()=>load());
+    load(); setInterval(load, 2000);
+  </script>
+</body>
+</html>"""
