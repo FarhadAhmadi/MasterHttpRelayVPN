@@ -1,0 +1,41 @@
+{
+  "mode": "apps_script",
+  "google_ip": "216.239.38.120",
+  "front_domain": "www.google.com",
+  "script_id": "AKfycbzlWkMghvKQmS39oQoS8IcjmtOPqh1S4O2cu3HRD1HI7Lh1JIhnaUntS2O1BYiZSfIeRA",
+  "auth_key": "FarhadAhmadi1413",
+
+  "listen_host": "127.0.0.1",
+  "listen_port": 8085,
+
+  "socks5_enabled": true,
+  "socks5_port": 1080,
+
+  "telegram_desktop_mode": true,
+  "profile": "max_speed",
+
+  "log_level": "INFO",
+  "verify_ssl": true,
+
+  "admin_enabled": true,
+  "admin_host": "127.0.0.1",
+  "admin_port": 9090,
+
+  "proxy_auth_enabled": false,
+
+  "relay_timeout": 22,
+  "tls_connect_timeout": 10,
+  "tcp_connect_timeout": 5,
+
+  "parallel_relay": 3,
+  "chunked_download_max_parallel": 20,
+  "chunked_download_chunk_size": 262144,
+
+  "self_heal_enabled": true,
+  "self_heal_window_s": 30,
+  "self_heal_error_threshold": 8,
+
+  "metrics_redact_query": true,
+  "metrics_hash_hosts": false,
+  "metrics_include_recent_paths": false
+}

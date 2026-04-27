@@ -9,6 +9,7 @@ as JSON to script.google.com fronted through www.google.com).
 import asyncio
 import base64
 import hmac
+import json
 import logging
 import os
 import re
@@ -131,6 +132,13 @@ class ResponseCache:
         self._store[url] = (raw_response, time.time() + ttl)
         self._size += size
 
+    def clear(self, *, reset_stats: bool = False) -> None:
+        self._store.clear()
+        self._size = 0
+        if reset_stats:
+            self.hits = 0
+            self.misses = 0
+
     @staticmethod
     def parse_ttl(raw_response: bytes, url: str) -> int:
         """Determine cache TTL from response headers and URL."""
@@ -192,6 +200,8 @@ class ProxyServer:
     )
 
     def __init__(self, config: dict):
+        self._config = dict(config)
+        self._config_path = str(config.get("_config_path", "")).strip()
         self.host = config.get("listen_host", "127.0.0.1")
         self.port = config.get("listen_port", 8080)
         self.socks_enabled = config.get("socks5_enabled", True)
@@ -245,6 +255,9 @@ class ProxyServer:
             config, "admin_port", 9090, minimum=1,
         )
         self._admin_token = str(config.get("admin_token", "")).strip()
+        self._admin_token_scopes = self._normalize_admin_token_scopes(
+            config.get("admin_token_scopes", {})
+        )
         self._proxy_auth_enabled = bool(config.get("proxy_auth_enabled", False))
         self._proxy_username = str(config.get("proxy_username", ""))
         self._proxy_password = str(config.get("proxy_password", ""))
@@ -355,6 +368,61 @@ class ProxyServer:
         except (TypeError, ValueError):
             value = default
         return max(minimum, value)
+
+    @staticmethod
+    def _scope_expand(level: str) -> set[str]:
+        if level == "admin":
+            return {"read", "write", "admin"}
+        if level == "write":
+            return {"read", "write"}
+        return {"read"}
+
+    @staticmethod
+    def _scope_normalize_name(raw: str) -> str:
+        token = str(raw).strip().lower()
+        if token in {"admin", "owner", "root", "all", "full"}:
+            return "admin"
+        if token in {"write", "operator", "ops"}:
+            return "write"
+        return "read"
+
+    @classmethod
+    def _normalize_admin_token_scopes(cls, raw) -> dict[str, set[str]]:
+        out: dict[str, set[str]] = {}
+        if not isinstance(raw, dict):
+            return out
+        for token, scopes in raw.items():
+            key = str(token or "").strip()
+            if not key:
+                continue
+            allowed = set()
+            if isinstance(scopes, str):
+                allowed |= cls._scope_expand(cls._scope_normalize_name(scopes))
+            elif isinstance(scopes, (list, tuple)):
+                for item in scopes:
+                    allowed |= cls._scope_expand(cls._scope_normalize_name(str(item)))
+            if not allowed:
+                allowed = {"read"}
+            out[key] = allowed
+        return out
+
+    def _admin_auth(self, supplied_token: str) -> tuple[bool, set[str]]:
+        token = str(supplied_token or "").strip()
+        if not self._admin_token and not self._admin_token_scopes:
+            return True, {"read", "write", "admin"}
+        if token and token in self._admin_token_scopes:
+            return True, set(self._admin_token_scopes[token])
+        if token and self._admin_token and hmac.compare_digest(token, self._admin_token):
+            return True, {"read", "write", "admin"}
+        return False, set()
+
+    @staticmethod
+    def _admin_has_scope(scopes: set[str], required: str) -> bool:
+        if required == "admin":
+            return "admin" in scopes
+        if required == "write":
+            return "write" in scopes or "admin" in scopes
+        return "read" in scopes or "write" in scopes or "admin" in scopes
 
     @classmethod
     def _normalize_download_extensions(cls, raw) -> tuple[tuple[str, ...], bool]:
@@ -2079,17 +2147,23 @@ class ProxyServer:
                 await writer.drain()
                 return
 
-            if self._admin_token:
-                supplied = headers.get("x-admin-token", "")
-                if supplied != self._admin_token:
+            auth_ok, scopes = self._admin_auth(headers.get("x-admin-token", ""))
+            if not auth_ok:
+                writer.write(
+                    b"HTTP/1.1 401 Unauthorized\r\n"
+                    b"Content-Length: 0\r\n\r\n"
+                )
+                await writer.drain()
+                return
+
+            if path == "/" or path.startswith("/?"):
+                if not self._admin_has_scope(scopes, "read"):
                     writer.write(
-                        b"HTTP/1.1 401 Unauthorized\r\n"
+                        b"HTTP/1.1 403 Forbidden\r\n"
                         b"Content-Length: 0\r\n\r\n"
                     )
                     await writer.drain()
                     return
-
-            if path == "/" or path.startswith("/?"):
                 body = self._admin_html().encode()
                 writer.write(
                     b"HTTP/1.1 200 OK\r\n"
@@ -2101,6 +2175,13 @@ class ProxyServer:
                 return
 
             if path.startswith("/api/summary"):
+                if not self._admin_has_scope(scopes, "read"):
+                    writer.write(
+                        b"HTTP/1.1 403 Forbidden\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
                 snap = await self._telemetry.snapshot(top_hosts=30, recent_limit=150)
                 snap["relay"] = self.fronter.stats_snapshot()
                 snap["cache_store"] = {
@@ -2123,11 +2204,91 @@ class ProxyServer:
                     "file": self._route_rules_file,
                     "count": len(self._route_rules),
                 }
+                snap["settings"] = self._admin_runtime_settings()
                 writer.write(TelemetryStore.json_response(snap))
                 await writer.drain()
                 return
 
+            if path.startswith("/api/settings") and not path.startswith("/api/settings/persist"):
+                if method == "GET":
+                    if not self._admin_has_scope(scopes, "read"):
+                        writer.write(
+                            b"HTTP/1.1 403 Forbidden\r\n"
+                            b"Content-Length: 0\r\n\r\n"
+                        )
+                        await writer.drain()
+                        return
+                    writer.write(
+                        TelemetryStore.json_response(self._admin_runtime_settings())
+                    )
+                    await writer.drain()
+                    return
+                if not self._admin_has_scope(scopes, "write"):
+                    writer.write(
+                        b"HTTP/1.1 403 Forbidden\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
+                payload = {}
+                if body_data:
+                    try:
+                        payload = json.loads(body_data.decode("utf-8", errors="replace"))
+                    except Exception:
+                        writer.write(
+                            b"HTTP/1.1 400 Bad Request\r\n"
+                            b"Content-Length: 0\r\n\r\n"
+                        )
+                        await writer.drain()
+                        return
+                if not isinstance(payload, dict):
+                    writer.write(
+                        b"HTTP/1.1 400 Bad Request\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
+                errors = self._apply_admin_settings(payload)
+                writer.write(TelemetryStore.json_response({
+                    "ok": not errors,
+                    "errors": errors,
+                    "settings": self._admin_runtime_settings(),
+                }))
+                await writer.drain()
+                return
+
+            if path.startswith("/api/settings/persist"):
+                if method != "POST":
+                    writer.write(
+                        b"HTTP/1.1 405 Method Not Allowed\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
+                if not self._admin_has_scope(scopes, "admin"):
+                    writer.write(
+                        b"HTTP/1.1 403 Forbidden\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
+                ok, message = self._persist_runtime_settings_to_config()
+                writer.write(TelemetryStore.json_response({
+                    "ok": ok,
+                    "message": message,
+                    "settings": self._admin_runtime_settings(),
+                }))
+                await writer.drain()
+                return
+
             if path.startswith("/api/top-hosts"):
+                if not self._admin_has_scope(scopes, "read"):
+                    writer.write(
+                        b"HTTP/1.1 403 Forbidden\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
                 limit = 20
                 if "?" in path:
                     try:
@@ -2144,6 +2305,13 @@ class ProxyServer:
                 return
 
             if path.startswith("/api/recent.csv"):
+                if not self._admin_has_scope(scopes, "read"):
+                    writer.write(
+                        b"HTTP/1.1 403 Forbidden\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
                 csv_body = await self._telemetry.recent_csv(limit=1000)
                 writer.write(
                     b"HTTP/1.1 200 OK\r\n"
@@ -2156,6 +2324,13 @@ class ProxyServer:
                 return
 
             if path.startswith("/metrics"):
+                if not self._admin_has_scope(scopes, "read"):
+                    writer.write(
+                        b"HTTP/1.1 403 Forbidden\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
                 text = await self._telemetry.prometheus_text()
                 if self._route_decisions:
                     lines = [text.rstrip("\n")]
@@ -2183,10 +2358,61 @@ class ProxyServer:
                 await writer.drain()
                 return
 
+            if path.startswith("/api/cache/clear"):
+                if method != "POST":
+                    writer.write(
+                        b"HTTP/1.1 405 Method Not Allowed\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
+                if not self._admin_has_scope(scopes, "write"):
+                    writer.write(
+                        b"HTTP/1.1 403 Forbidden\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
+                self._cache.clear(reset_stats=True)
+                writer.write(TelemetryStore.json_response({"ok": True, "cleared": True}))
+                await writer.drain()
+                return
+
+            if path.startswith("/api/route-rules/reload"):
+                if method != "POST":
+                    writer.write(
+                        b"HTTP/1.1 405 Method Not Allowed\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
+                if not self._admin_has_scope(scopes, "write"):
+                    writer.write(
+                        b"HTTP/1.1 403 Forbidden\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
+                self._route_rules = self._load_route_rules(self._route_rules_file)
+                writer.write(TelemetryStore.json_response({
+                    "ok": True,
+                    "file": self._route_rules_file,
+                    "count": len(self._route_rules),
+                }))
+                await writer.drain()
+                return
+
             if path.startswith("/api/reset"):
                 if method != "POST":
                     writer.write(
                         b"HTTP/1.1 405 Method Not Allowed\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
+                if not self._admin_has_scope(scopes, "write"):
+                    writer.write(
+                        b"HTTP/1.1 403 Forbidden\r\n"
                         b"Content-Length: 0\r\n\r\n"
                     )
                     await writer.drain()
@@ -2200,6 +2426,13 @@ class ProxyServer:
                 return
 
             if path.startswith("/healthz"):
+                if not self._admin_has_scope(scopes, "read"):
+                    writer.write(
+                        b"HTTP/1.1 403 Forbidden\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
                 writer.write(
                     b"HTTP/1.1 200 OK\r\n"
                     b"Content-Type: application/json\r\n"
@@ -2224,6 +2457,93 @@ class ProxyServer:
             except Exception:
                 pass
 
+    def _admin_runtime_settings(self) -> dict[str, object]:
+        return {
+            "self_heal_enabled": self._self_heal_enabled,
+            "telegram_desktop_mode": self._telegram_desktop_mode,
+            "download_max_parallel": self._download_max_parallel,
+            "metrics_hash_hosts": self._telemetry._hash_hosts,
+            "metrics_redact_query": self._telemetry._redact_query,
+            "metrics_include_recent_paths": self._telemetry._include_recent_paths,
+            "route_rules_file": self._route_rules_file,
+            "route_rules_count": len(self._route_rules),
+            "config_path": self._config_path or "",
+            "config_persist_available": bool(self._config_path),
+            "admin_auth_mode": (
+                "scoped_tokens"
+                if self._admin_token_scopes else
+                ("single_token" if self._admin_token else "disabled")
+            ),
+        }
+
+    def _apply_admin_settings(self, payload: dict[str, object]) -> list[str]:
+        errors: list[str] = []
+        bool_keys = (
+            "self_heal_enabled",
+            "telegram_desktop_mode",
+            "metrics_hash_hosts",
+            "metrics_redact_query",
+            "metrics_include_recent_paths",
+        )
+        for key in bool_keys:
+            if key not in payload:
+                continue
+            value = payload.get(key)
+            if not isinstance(value, bool):
+                errors.append(f"{key} must be boolean")
+                continue
+            if key == "self_heal_enabled":
+                self._self_heal_enabled = value
+            elif key == "telegram_desktop_mode":
+                self._telegram_desktop_mode = value
+            elif key == "metrics_hash_hosts":
+                self._telemetry._hash_hosts = value
+            elif key == "metrics_redact_query":
+                self._telemetry._redact_query = value
+            elif key == "metrics_include_recent_paths":
+                self._telemetry._include_recent_paths = value
+
+        if "download_max_parallel" in payload:
+            value = payload.get("download_max_parallel")
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                parsed = 0
+            if not 1 <= parsed <= 64:
+                errors.append("download_max_parallel must be an integer between 1 and 64")
+            else:
+                self._download_max_parallel = parsed
+        return errors
+
+    def _persist_runtime_settings_to_config(self) -> tuple[bool, str]:
+        if not self._config_path:
+            return False, "config path not set"
+        updates = {
+            "self_heal_enabled": self._self_heal_enabled,
+            "telegram_desktop_mode": self._telegram_desktop_mode,
+            "chunked_download_max_parallel": self._download_max_parallel,
+            "metrics_hash_hosts": self._telemetry._hash_hosts,
+            "metrics_redact_query": self._telemetry._redact_query,
+            "metrics_include_recent_paths": self._telemetry._include_recent_paths,
+        }
+        try:
+            on_disk = {}
+            if os.path.exists(self._config_path):
+                with open(self._config_path, "r", encoding="utf-8") as f:
+                    parsed = json.load(f)
+                    if isinstance(parsed, dict):
+                        on_disk = parsed
+            on_disk.update(updates)
+            tmp_path = self._config_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(on_disk, f, indent=2)
+                f.write("\n")
+            os.replace(tmp_path, self._config_path)
+            self._config.update(updates)
+            return True, f"saved to {self._config_path}"
+        except Exception as exc:
+            return False, str(exc)
+
     @staticmethod
     def _admin_html() -> str:
         return """<!doctype html>
@@ -2231,101 +2551,261 @@ class ProxyServer:
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>MasterHttpRelayVPN Dashboard</title>
+  <title>MasterHttpRelayVPN Admin Panel</title>
   <style>
-    :root { --bg:#0f172a; --card:#111827; --muted:#94a3b8; --text:#e2e8f0; --good:#22c55e; --warn:#f59e0b; --bad:#ef4444; --accent:#38bdf8; }
-    body{margin:0;font-family:ui-sans-serif,system-ui,Segoe UI,Arial;background:linear-gradient(180deg,#0b1220,#0f172a);color:var(--text);}
-    .wrap{max-width:1200px;margin:0 auto;padding:18px;}
-    h1{margin:0 0 12px;font-size:22px;}
-    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;}
-    .card{background:var(--card);border:1px solid #1f2937;border-radius:10px;padding:12px;}
-    .label{font-size:12px;color:var(--muted);}
-    .value{font-size:22px;font-weight:700;margin-top:4px;}
-    table{width:100%;border-collapse:collapse;font-size:13px;}
-    th,td{padding:7px;border-bottom:1px solid #1f2937;text-align:left;}
-    th{color:var(--muted);font-weight:600;}
-    .row{display:grid;grid-template-columns:2fr 3fr 2fr;gap:10px;margin-top:10px;}
-    .toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:10px 0;}
-    button{background:#1e293b;border:1px solid #334155;color:#e2e8f0;padding:7px 10px;border-radius:8px;cursor:pointer}
-    button:hover{background:#273449}
-    input{background:#0b1220;border:1px solid #334155;color:#e2e8f0;padding:7px 10px;border-radius:8px}
-    .mono{font-family:ui-monospace,Consolas,monospace;}
+    :root{--bg:#071021;--bg2:#0d172c;--card:#111d35;--stroke:#223555;--text:#e2ebff;--muted:#8fa7cf;--accent:#39c6ff;--accent2:#5ee1a2;--warn:#f6b949;--bad:#ff6b7d;}
+    *{box-sizing:border-box}body{margin:0;color:var(--text);font-family:system-ui,Segoe UI,Arial;background:radial-gradient(circle at 8% 0,#162a4e 0,#071021 45%,#050c18 100%);}
+    .wrap{max-width:1400px;margin:0 auto;padding:16px}
+    .top{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center}
+    h1{margin:0;font-size:23px;letter-spacing:.3px}
+    .label{color:var(--muted);font-size:12px}
+    .chip{padding:6px 10px;border:1px solid var(--stroke);border-radius:999px;background:#0c1830}
+    .toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}
+    .toolbar input,.toolbar select,.settings input,.settings select{background:#091327;border:1px solid var(--stroke);color:var(--text);padding:7px 10px;border-radius:8px}
+    button{background:#183157;border:1px solid #2a4a77;color:var(--text);padding:7px 11px;border-radius:8px;cursor:pointer}
+    button:hover{background:#21406f}.ghost{background:#101b33;border-color:var(--stroke)}
+    .grid{margin-top:10px;display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}
+    .card{background:linear-gradient(180deg,var(--card),#0f1b33);border:1px solid var(--stroke);border-radius:12px;padding:12px}
+    .value{font-size:21px;font-weight:700;margin-top:3px}
+    .panes{margin-top:10px;display:grid;grid-template-columns:2.3fr 1fr;gap:10px}
+    .subgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+    table{width:100%;border-collapse:collapse;font-size:12px}th,td{text-align:left;padding:6px;border-bottom:1px solid #213557}th{color:var(--muted);font-weight:600}
+    .mono{font-family:Consolas,ui-monospace,monospace}
+    .status-ok{color:var(--accent2)}.status-bad{color:var(--bad)}
+    .footer{margin-top:10px;font-size:12px;color:var(--muted)}
     a{color:var(--accent)}
-    @media(max-width:1100px){.row{grid-template-columns:1fr}}
+    svg{width:100%;height:190px;background:#091327;border-radius:8px}
+    .legend{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px}
+    .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px;vertical-align:middle}
+    .settings label{display:block;font-size:12px;color:var(--muted);margin-bottom:3px}
+    .settings-row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:8px 0}
+    .switches{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:8px}
+    .switches label{display:flex;align-items:center;gap:6px;color:var(--text)}
+    #toast{position:fixed;right:14px;bottom:14px;background:#102241;border:1px solid var(--stroke);padding:9px 12px;border-radius:8px;opacity:0;transition:opacity .2s ease}
+    #toast.show{opacity:1}
+    @media(max-width:1180px){.panes{grid-template-columns:1fr}.subgrid{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
   <div class="wrap">
-    <h1>MasterHttpRelayVPN Dashboard</h1>
-    <div class="grid" id="cards"></div>
-    <div class="card" style="margin-top:10px">
-      <h3 style="margin-top:0">Traffic (rolling)</h3>
-      <svg id="chart" viewBox="0 0 900 170" style="width:100%;height:170px;background:#0b1220;border-radius:8px"></svg>
+    <div class="top">
+      <h1>MasterHttpRelayVPN Admin Panel</h1>
+      <div class="chip">Uptime: <span id="uptime">-</span></div>
     </div>
     <div class="toolbar">
-      <input id="filter" placeholder="Filter host (contains)..." />
-      <button onclick="downloadCsv()">Download CSV</button>
-      <button onclick="resetStats()">Reset Stats</button>
-      <span class="label">CSV endpoint: <a href="/api/recent.csv" target="_blank">/api/recent.csv</a></span>
+      <input id="hostFilter" placeholder="Filter host..." />
+      <select id="refreshMs">
+        <option value="1000">1s refresh</option><option value="2000" selected>2s refresh</option>
+        <option value="5000">5s refresh</option><option value="10000">10s refresh</option>
+      </select>
+      <label class="label"><input id="autoRefresh" type="checkbox" checked /> auto refresh</label>
+      <label class="label"><input id="chartReq" type="checkbox" checked /> requests</label>
+      <label class="label"><input id="chartErr" type="checkbox" checked /> errors</label>
+      <label class="label"><input id="chartDown" type="checkbox" checked /> download</label>
+      <button class="ghost" id="btnRefresh">Refresh now</button>
+      <button class="ghost" id="btnCsv">CSV</button>
+      <button class="ghost" id="btnJson">JSON</button>
     </div>
-    <div class="row">
-      <div class="card"><h3>Top Hosts</h3><table id="hosts"></table></div>
-      <div class="card"><h3>Recent Requests</h3><table id="recent"></table></div>
-      <div class="card"><h3>Route Decisions</h3><table id="routes"></table></div>
+    <div class="grid" id="cards"></div>
+    <div class="card" style="margin-top:10px">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+        <strong>Traffic Timeline</strong>
+        <span class="label" id="chartSummary">-</span>
+      </div>
+      <svg id="chart" viewBox="0 0 980 190"></svg>
+      <div class="legend">
+        <span><span class="dot" style="background:#39c6ff"></span>requests</span>
+        <span><span class="dot" style="background:#ff6b7d"></span>errors</span>
+        <span><span class="dot" style="background:#5ee1a2"></span>download bytes</span>
+      </div>
     </div>
-    <p class="label">Prometheus endpoint: <a href="/metrics" target="_blank">/metrics</a> · JSON: <a href="/api/summary" target="_blank">/api/summary</a></p>
+    <div class="panes">
+      <div class="subgrid">
+        <div class="card"><strong>Top Hosts</strong><table id="hosts"></table></div>
+        <div class="card"><strong>Recent Requests</strong><table id="recent"></table></div>
+        <div class="card"><strong>Route Decisions</strong><table id="routes"></table></div>
+        <div class="card"><strong>Methods / Status / Errors</strong><table id="mix"></table></div>
+        <div class="card">
+          <strong>Status Class + Latency</strong>
+          <div class="label" style="margin:6px 0 4px">HTTP status classes</div>
+          <svg id="statusChart" viewBox="0 0 380 110" style="height:110px"></svg>
+          <div class="label" style="margin:8px 0 4px">Latency percentiles (recent)</div>
+          <svg id="latencyChart" viewBox="0 0 380 110" style="height:110px"></svg>
+        </div>
+      </div>
+      <div class="card settings">
+        <strong>Runtime Settings</strong>
+        <div class="settings-row">
+          <div><label>Download max parallel</label><input id="s_download_max_parallel" type="number" min="1" max="64" /></div>
+          <div><label>Top hosts rows</label><input id="s_top_hosts" type="number" min="5" max="50" value="15" /></div>
+        </div>
+        <div class="switches">
+          <label><input id="s_self_heal_enabled" type="checkbox" />self-heal enabled</label>
+          <label><input id="s_telegram_desktop_mode" type="checkbox" />telegram desktop mode</label>
+          <label><input id="s_metrics_hash_hosts" type="checkbox" />hash host names</label>
+          <label><input id="s_metrics_redact_query" type="checkbox" />redact query string</label>
+          <label><input id="s_metrics_include_recent_paths" type="checkbox" />include recent paths</label>
+        </div>
+        <div class="toolbar" style="margin-top:10px">
+          <button id="btnSaveSettings">Save settings</button>
+          <button id="btnSaveSettingsDisk">Save to config</button>
+          <button class="ghost" id="btnReloadRules">Reload route rules</button>
+          <button class="ghost" id="btnClearCache">Clear cache</button>
+          <button class="ghost" id="btnReset">Reset telemetry</button>
+        </div>
+        <div class="footer" id="settingsMeta">-</div>
+      </div>
+    </div>
+    <div class="footer">Prometheus: <a href="/metrics" target="_blank">/metrics</a> | Summary: <a href="/api/summary" target="_blank">/api/summary</a></div>
   </div>
+  <div id="toast"></div>
   <script>
-    function fbytes(n){if(!n)return "0 B";const u=["B","KB","MB","GB"];let i=0,v=n;while(v>=1024&&i<u.length-1){v/=1024;i++}return v.toFixed(i?1:0)+" "+u[i]}
+    const state={summary:null,timer:null};
+    const statusEl=document.getElementById("toast");
+    function toast(msg,isErr=false){statusEl.textContent=msg;statusEl.style.borderColor=isErr?"#7a2435":"#225e6a";statusEl.classList.add("show");setTimeout(()=>statusEl.classList.remove("show"),1600);}
+    function fbytes(n){if(!n)return "0 B";const u=["B","KB","MB","GB","TB"];let i=0,v=Number(n)||0;while(v>=1024&&i<u.length-1){v/=1024;i++}return v.toFixed(i?1:0)+" "+u[i]}
     function pct(n){return Number(n||0).toFixed(2)+"%"}
-    function linePath(vals,w,h,pad){
-      if(!vals.length)return "";
-      const max=Math.max(...vals,1), n=vals.length;
-      return vals.map((v,i)=>`${i===0?"M":"L"} ${pad + (i*(w-2*pad)/Math.max(1,n-1))} ${h-pad-(v/max)*(h-2*pad)}`).join(" ");
+    function fmtUptime(s){s=Number(s)||0;const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),x=s%60;return `${h}h ${m}m ${x}s`}
+    function linePath(vals,w,h,pad,maxV){if(!vals.length)return "";const n=vals.length,m=maxV||Math.max(...vals,1);return vals.map((v,i)=>`${i===0?"M":"L"} ${pad+(i*(w-2*pad)/Math.max(1,n-1))} ${h-pad-(v/m)*(h-2*pad)}`).join(" ");}
+    function entriesTable(obj,headA,headB,maxRows=10){const rows=Object.entries(obj||{}).sort((a,b)=>b[1]-a[1]).slice(0,maxRows);return `<tr><th>${headA}</th><th>${headB}</th></tr>`+rows.map(r=>`<tr><td class="mono">${r[0]}</td><td>${r[1]}</td></tr>`).join("");}
+    function percentile(vals,p){
+      if(!vals.length)return 0;
+      const a=vals.slice().sort((x,y)=>x-y);
+      const i=Math.min(a.length-1,Math.max(0,Math.floor((p/100)*(a.length-1))));
+      return a[i];
     }
     function drawChart(ts){
-      const svg=document.getElementById("chart");
-      const w=900,h=170,p=16;
-      const req=(ts||[]).map(x=>x.requests||0);
-      const down=(ts||[]).map(x=>x.resp_bytes||0);
-      const p1=linePath(req,w,h,p), p2=linePath(down,w,h,p);
-      svg.innerHTML=
-        `<path d="${p1}" fill="none" stroke="#38bdf8" stroke-width="2"/>`+
-        `<path d="${p2}" fill="none" stroke="#22c55e" stroke-width="2"/>`+
-        `<text x="${p}" y="14" fill="#94a3b8" font-size="11">blue=request count, green=download bytes</text>`;
+      const svg=document.getElementById("chart"),w=980,h=190,p=14,data=ts||[];
+      const req=data.map(x=>x.requests||0),err=data.map(x=>x.errors||0),down=data.map(x=>x.resp_bytes||0);
+      const reqOn=document.getElementById("chartReq").checked,errOn=document.getElementById("chartErr").checked,downOn=document.getElementById("chartDown").checked;
+      const maxV=Math.max(1,...(reqOn?req:[0]),...(errOn?err:[0]),...(downOn?down:[0]));
+      let out="";
+      if(reqOn) out+=`<path d="${linePath(req,w,h,p,maxV)}" fill="none" stroke="#39c6ff" stroke-width="2"/>`;
+      if(errOn) out+=`<path d="${linePath(err,w,h,p,maxV)}" fill="none" stroke="#ff6b7d" stroke-width="2"/>`;
+      if(downOn) out+=`<path d="${linePath(down,w,h,p,maxV)}" fill="none" stroke="#5ee1a2" stroke-width="2"/>`;
+      svg.innerHTML=out||`<text x="20" y="30" fill="#8fa7cf">enable at least one series</text>`;
+      const last=data[data.length-1]||{};
+      document.getElementById("chartSummary").textContent=`last bucket: req ${last.requests||0}, err ${last.errors||0}, down ${fbytes(last.resp_bytes||0)}`;
+    }
+    function drawStatusClassChart(statuses){
+      const svg=document.getElementById("statusChart");
+      const classes={"2xx":0,"3xx":0,"4xx":0,"5xx":0,"other":0};
+      Object.entries(statuses||{}).forEach(([code,count])=>{
+        const c=String(code||"");
+        if(c.startsWith("2")) classes["2xx"]+=Number(count)||0;
+        else if(c.startsWith("3")) classes["3xx"]+=Number(count)||0;
+        else if(c.startsWith("4")) classes["4xx"]+=Number(count)||0;
+        else if(c.startsWith("5")) classes["5xx"]+=Number(count)||0;
+        else classes.other+=Number(count)||0;
+      });
+      const keys=Object.keys(classes), vals=keys.map(k=>classes[k]), maxV=Math.max(1,...vals);
+      const colors={"2xx":"#5ee1a2","3xx":"#39c6ff","4xx":"#f6b949","5xx":"#ff6b7d","other":"#8fa7cf"};
+      const barW=56,gap=16,baseY=98;
+      svg.innerHTML=keys.map((k,i)=>{
+        const h=Math.max(2,Math.round((vals[i]/maxV)*72)),x=14+i*(barW+gap),y=baseY-h;
+        return `<rect x="${x}" y="${y}" width="${barW}" height="${h}" rx="6" fill="${colors[k]}"/>`+
+               `<text x="${x+barW/2}" y="108" text-anchor="middle" fill="#8fa7cf" font-size="11">${k}</text>`+
+               `<text x="${x+barW/2}" y="${y-4}" text-anchor="middle" fill="#e2ebff" font-size="10">${vals[i]}</text>`;
+      }).join("");
+    }
+    function drawLatencyChart(recent){
+      const svg=document.getElementById("latencyChart");
+      const vals=(recent||[]).map(r=>Number(r.latency_ms)||0).filter(v=>v>0);
+      const p50=percentile(vals,50),p90=percentile(vals,90),p99=percentile(vals,99),mx=Math.max(1,p50,p90,p99);
+      const rows=[["p50",p50,"#39c6ff"],["p90",p90,"#f6b949"],["p99",p99,"#ff6b7d"]];
+      const barW=72,gap=28,baseY=98;
+      svg.innerHTML=rows.map((r,i)=>{
+        const h=Math.max(2,Math.round((r[1]/mx)*72)),x=24+i*(barW+gap),y=baseY-h;
+        return `<rect x="${x}" y="${y}" width="${barW}" height="${h}" rx="6" fill="${r[2]}"/>`+
+               `<text x="${x+barW/2}" y="108" text-anchor="middle" fill="#8fa7cf" font-size="11">${r[0]}</text>`+
+               `<text x="${x+barW/2}" y="${y-4}" text-anchor="middle" fill="#e2ebff" font-size="10">${r[1].toFixed(1)}ms</text>`;
+      }).join("")+`<text x="260" y="15" fill="#8fa7cf" font-size="10">n=${vals.length}</text>`;
+    }
+    function syncSettingControls(s){
+      if(!s)return;
+      ["self_heal_enabled","telegram_desktop_mode","metrics_hash_hosts","metrics_redact_query","metrics_include_recent_paths"].forEach(k=>{
+        const el=document.getElementById("s_"+k); if(el) el.checked=!!s[k];
+      });
+      document.getElementById("s_download_max_parallel").value=s.download_max_parallel||8;
+      document.getElementById("settingsMeta").textContent=`route rules: ${s.route_rules_file||"-"} (${s.route_rules_count||0} rules) | auth: ${s.admin_auth_mode||"-"} | config: ${s.config_path||"not available"}`;
+    }
+    function render(summary){
+      state.summary=summary;
+      const t=summary.totals||{}, cache=summary.cache_store||{}, relay=summary.relay||{}, tg=summary.telegram?.stats||{}, uptime=summary.uptime_s||0;
+      const reqRate=uptime? (t.requests/uptime).toFixed(2) : "0.00";
+      const cacheTotal=(cache.hits||0)+(cache.misses||0), cacheHitRate=cacheTotal?(100*(cache.hits||0)/cacheTotal):0;
+      document.getElementById("uptime").textContent=fmtUptime(uptime);
+      const cards=[
+        ["Requests",t.requests||0],["Errors",`${t.errors||0} (${pct(t.error_rate_pct)})`],["Req/s avg",reqRate],["Upload",fbytes(t.req_bytes||0)],
+        ["Download",fbytes(t.resp_bytes||0)],["Cache entries",cache.entries||0],["Cache hit rate",pct(cacheHitRate)],["Route rules",summary.route_rules?.count||0],
+        ["Relay fails",relay.failures||0],["Telegram decisions",tg.total||0]
+      ];
+      document.getElementById("cards").innerHTML=cards.map(c=>`<div class="card"><div class="label">${c[0]}</div><div class="value">${c[1]}</div></div>`).join("");
+      drawChart(summary.timeseries||[]);
+      const filter=(document.getElementById("hostFilter").value||"").toLowerCase();
+      const hostLimit=Math.max(5,Math.min(50,Number(document.getElementById("s_top_hosts").value)||15));
+      const hosts=(summary.top_hosts||[]).filter(h=>!filter||String(h.host||"").toLowerCase().includes(filter)).slice(0,hostLimit);
+      document.getElementById("hosts").innerHTML="<tr><th>Host</th><th>Req</th><th>Err</th><th>Down</th><th>Avg ms</th></tr>"+hosts.map(h=>`<tr><td class="mono">${h.host}</td><td>${h.requests}</td><td class="${h.errors?'status-bad':''}">${h.errors}</td><td>${fbytes(h.resp_bytes)}</td><td>${h.avg_latency_ms}</td></tr>`).join("");
+      const recent=(summary.recent||[]).slice().reverse().slice(0,18);
+      document.getElementById("recent").innerHTML="<tr><th>Time</th><th>Request</th><th>Status</th><th>Route</th></tr>"+recent.map(r=>`<tr><td>${new Date((r.ts||0)*1000).toLocaleTimeString()}</td><td class="mono">${r.method||\"?\"} ${r.host||\"\"}${r.path?\" \"+r.path:\"\"}</td><td class="${Number(r.status)>=400?"status-bad":"status-ok"}">${r.status||0}</td><td>${r.route||\"-\"}</td></tr>`).join("");
+      document.getElementById("routes").innerHTML=entriesTable(summary.route_decisions||{},"Route","Count",14);
+      document.getElementById("mix").innerHTML=entriesTable(summary.methods||{},"Method","Count",6)+`<tr><td colspan="2">&nbsp;</td></tr>`+entriesTable(summary.statuses||{},"Status","Count",8)+`<tr><td colspan="2">&nbsp;</td></tr>`+entriesTable(summary.errors||{},"Error","Count",8);
+      drawStatusClassChart(summary.statuses||{});
+      drawLatencyChart(summary.recent||[]);
+      syncSettingControls(summary.settings||{});
     }
     async function load(){
       const res=await fetch("/api/summary",{cache:"no-store"});
-      const d=await res.json();
-      const t=d.totals||{};
-      const tg=d.telegram?.stats||{};
-      const cards=[
-        ["Requests",t.requests||0],["Errors",t.errors||0],["Error Rate",pct(t.error_rate_pct)],
-        ["Upload",fbytes(t.req_bytes||0)],["Download",fbytes(t.resp_bytes||0)],
-        ["Uptime", (d.uptime_s||0)+"s"],["Cache Hits", (d.cache_store?.hits||0)],["Cache Misses",(d.cache_store?.misses||0)],
-        ["TG Decisions", tg.total||0]
-      ];
-      document.getElementById("cards").innerHTML=cards.map(x=>`<div class="card"><div class="label">${x[0]}</div><div class="value">${x[1]}</div></div>`).join("");
-      drawChart(d.timeseries||[]);
-      const filter=(document.getElementById("filter").value||"").toLowerCase();
-      const hosts=(d.top_hosts||[]).filter(h=>!filter||String(h.host).toLowerCase().includes(filter)).slice(0,12);
-      document.getElementById("hosts").innerHTML="<tr><th>Host</th><th>Req</th><th>Err</th><th>Down</th><th>Avg ms</th></tr>"+hosts.map(h=>`<tr><td class="mono">${h.host}</td><td>${h.requests}</td><td>${h.errors}</td><td>${fbytes(h.resp_bytes)}</td><td>${h.avg_latency_ms}</td></tr>`).join("");
-      const recent=(d.recent||[]).slice().reverse().slice(0,18);
-      document.getElementById("recent").innerHTML="<tr><th>Time</th><th>Req</th><th>Status</th><th>Route</th><th>Down</th></tr>"+recent.map(r=>`<tr><td>${new Date(r.ts*1000).toLocaleTimeString()}</td><td class="mono">${r.method} ${r.host}${r.path?(" "+r.path):""}</td><td>${r.status}</td><td>${r.route}</td><td>${fbytes(r.resp_bytes)}</td></tr>`).join("");
-      const routes=Object.entries(d.route_decisions||{}).sort((a,b)=>b[1]-a[1]).slice(0,16);
-      document.getElementById("routes").innerHTML="<tr><th>Route</th><th>Count</th></tr>"+routes.map(x=>`<tr><td class='mono'>${x[0]}</td><td>${x[1]}</td></tr>`).join("");
+      if(!res.ok){toast("Could not load summary",true);return;}
+      render(await res.json());
     }
-    async function resetStats(){
-      if(!confirm("Reset all telemetry counters?")) return;
-      const res=await fetch("/api/reset",{method:"POST"});
-      if(!res.ok){ alert("Reset failed"); return; }
-      await load();
+    async function postJson(url,body){
+      const res=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})});
+      let data={};try{data=await res.json()}catch(_){}
+      if(!res.ok){throw new Error("HTTP "+res.status);}
+      return data;
     }
-    function downloadCsv(){
-      window.open("/api/recent.csv","_blank");
+    async function saveSettings(){
+      const payload={
+        self_heal_enabled:document.getElementById("s_self_heal_enabled").checked,
+        telegram_desktop_mode:document.getElementById("s_telegram_desktop_mode").checked,
+        metrics_hash_hosts:document.getElementById("s_metrics_hash_hosts").checked,
+        metrics_redact_query:document.getElementById("s_metrics_redact_query").checked,
+        metrics_include_recent_paths:document.getElementById("s_metrics_include_recent_paths").checked,
+        download_max_parallel:Number(document.getElementById("s_download_max_parallel").value)||8
+      };
+      try{
+        const out=await postJson("/api/settings",payload);
+        if(out.errors&&out.errors.length){toast(out.errors.join("; "),true);}else{toast("Settings saved");}
+        await load();
+      }catch(_){toast("Save failed",true);}
     }
-    document.getElementById("filter").addEventListener("input",()=>load());
-    load(); setInterval(load, 2000);
+    async function saveSettingsDisk(){
+      try{
+        const out=await postJson("/api/settings/persist",{});
+        if(out.ok){toast("Config saved");}else{toast(out.message||"Config save failed",true);}
+        await load();
+      }catch(_){toast("Config save failed",true);}
+    }
+    async function reloadRouteRules(){try{const d=await postJson("/api/route-rules/reload",{});toast(`Route rules loaded: ${d.count||0}`);await load();}catch(_){toast("Reload failed",true);}}
+    async function clearCache(){if(!confirm("Clear cache entries and cache counters?"))return;try{await postJson("/api/cache/clear",{});toast("Cache cleared");await load();}catch(_){toast("Cache clear failed",true);}}
+    async function resetStats(){if(!confirm("Reset all telemetry counters?"))return;try{await postJson("/api/reset",{});toast("Telemetry reset");await load();}catch(_){toast("Reset failed",true);}}
+    function downloadCsv(){window.open("/api/recent.csv","_blank");}
+    function downloadJson(){if(!state.summary)return;const blob=new Blob([JSON.stringify(state.summary,null,2)],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="mhrvpn_summary.json";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000);}
+    function schedule(){if(state.timer)clearInterval(state.timer);const ms=Number(document.getElementById("refreshMs").value)||2000;state.timer=setInterval(()=>{if(document.getElementById("autoRefresh").checked)load();},ms);}
+    document.getElementById("btnRefresh").addEventListener("click",load);
+    document.getElementById("btnCsv").addEventListener("click",downloadCsv);
+    document.getElementById("btnJson").addEventListener("click",downloadJson);
+    document.getElementById("btnSaveSettings").addEventListener("click",saveSettings);
+    document.getElementById("btnSaveSettingsDisk").addEventListener("click",saveSettingsDisk);
+    document.getElementById("btnReloadRules").addEventListener("click",reloadRouteRules);
+    document.getElementById("btnClearCache").addEventListener("click",clearCache);
+    document.getElementById("btnReset").addEventListener("click",resetStats);
+    document.getElementById("hostFilter").addEventListener("input",()=>state.summary&&render(state.summary));
+    document.getElementById("s_top_hosts").addEventListener("input",()=>state.summary&&render(state.summary));
+    document.getElementById("refreshMs").addEventListener("change",schedule);
+    ["chartReq","chartErr","chartDown"].forEach(id=>document.getElementById(id).addEventListener("change",()=>state.summary&&drawChart(state.summary.timeseries||[])));
+    load();schedule();
   </script>
 </body>
 </html>"""

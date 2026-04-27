@@ -22,6 +22,7 @@ Main config file: `config.json`
 ## Admin + metrics
 
 - `admin_enabled`, `admin_host`, `admin_port`, `admin_token`
+- `admin_token_scopes` (token -> `read` / `write` / `admin`)
 - `metrics_max_recent_events`
 - `metrics_bucket_seconds`, `metrics_max_buckets`
 - `metrics_redact_query`, `metrics_hash_hosts`, `metrics_include_recent_paths`
@@ -66,3 +67,13 @@ Route rules format:
 See example: [`route_rules.example.txt`](../../route_rules.example.txt)
 
 See defaults in [`config.example.json`](../../config.example.json).
+
+Example scoped admin tokens:
+
+```json
+"admin_token_scopes": {
+  "viewer-token": ["read"],
+  "operator-token": ["write"],
+  "owner-token": ["admin"]
+}
+```

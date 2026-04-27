@@ -21,4 +21,4 @@ Welcome to the structured v1 documentation set.
 - Root README: [`README.md`](../../README.md)
 - Farsi docs index: [`docs/fa/INDEX.md`](../fa/INDEX.md)
 - Changelog: [`CHANGELOG.md`](../../CHANGELOG.md)
-- Release notes v1.2.0: [`RELEASE_NOTES_v1.2.0.md`](../../RELEASE_NOTES_v1.2.0.md)
+- Release notes v1.3.0: [`RELEASE_NOTES_v1.3.0.md`](../../RELEASE_NOTES_v1.3.0.md)

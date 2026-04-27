@@ -485,6 +485,9 @@ def main():
         rc = _run_telegram_diagnose(config)
         sys.exit(rc)
 
+    # Runtime-only metadata for components that may persist safe settings.
+    config["_config_path"] = os.path.abspath(config_path)
+
     # Environment variable overrides
     if os.environ.get("DFT_AUTH_KEY"):
         config["auth_key"] = os.environ["DFT_AUTH_KEY"]

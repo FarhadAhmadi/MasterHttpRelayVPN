@@ -1,0 +1,43 @@
+{
+  "mode": "apps_script",
+  "google_ip": "216.239.38.120",
+  "front_domain": "www.google.com",
+  "script_id": "AKfycbzlWkMghvKQmS39oQoS8IcjmtOPqh1S4O2cu3HRD1HI7Lh1JIhnaUntS2O1BYiZSfIeRA",
+  "auth_key": "FarhadAhmadi1413",
+
+  "listen_host": "127.0.0.1",
+  "listen_port": 8085,
+
+  "socks5_enabled": true,
+  "socks5_port": 1080,
+
+  "telegram_desktop_mode": true,
+  "profile": "balanced",
+
+  "log_level": "INFO",
+  "verify_ssl": true,
+
+  "admin_enabled": true,
+  "admin_host": "127.0.0.1",
+  "admin_port": 9090,
+  "admin_token": "CHANGE_THIS_ADMIN_TOKEN",
+
+  "proxy_auth_enabled": true,
+  "proxy_username": "proxyuser",
+  "proxy_password": "proxypass",
+
+  "relay_timeout": 30,
+  "tls_connect_timeout": 12,
+  "tcp_connect_timeout": 8,
+
+  "parallel_relay": 2,
+  "chunked_download_max_parallel": 10,
+
+  "self_heal_enabled": true,
+
+  "metrics_redact_query": true,
+  "metrics_hash_hosts": true,
+  "metrics_include_recent_paths": false,
+
+  "telemetry_jsonl_enabled": false
+}

@@ -6,6 +6,7 @@
 - در صورت دسترسی دیگران، احراز هویت پروکسی را روشن کنید.
 - `admin_host=127.0.0.1` بماند.
 - اگر پنل خارج از localhost باز است، `admin_token` تنظیم کنید.
+- بهتر است برای تفکیک دسترسی از `admin_token_scopes` استفاده کنید.
 - `ca/ca.key` را هرگز منتشر نکنید.
 - `config.json` را commit نکنید.
 
@@ -14,4 +15,3 @@
 - `metrics_redact_query=true`
 - `metrics_hash_hosts=true`
 - `metrics_include_recent_paths=false`
-

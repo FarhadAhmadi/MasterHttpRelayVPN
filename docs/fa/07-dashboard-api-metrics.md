@@ -13,13 +13,21 @@
 - recent requests
 - route decisions
 - نمودار زنده
+- نمودار کلاس وضعیت (2xx/3xx/4xx/5xx)
+- نمودار صدک‌های latency (از recent events)
 - شمارنده رویدادهای self-heal
+- کنترل تنظیمات runtime (اعمال زنده + ذخیره در config)
 
 ## API
 
 - `GET /api/summary`
+- `GET /api/settings`
+- `POST /api/settings`
+- `POST /api/settings/persist`
 - `GET /api/top-hosts?limit=20`
 - `GET /api/recent.csv`
+- `POST /api/cache/clear`
+- `POST /api/route-rules/reload`
 - `POST /api/reset`
 - `GET /healthz`
 
@@ -53,3 +61,9 @@
 ```http
 X-Admin-Token: your_token
 ```
+
+اگر `admin_token_scopes` تنظیم شود، می‌توانید دسترسی را تفکیک کنید:
+
+- `read`: داشبورد، summary، metrics، CSV، health
+- `write`: read + تغییرات runtime (`/api/settings` و reset/cache/rules)
+- `admin`: write + ذخیره تنظیمات در فایل (`/api/settings/persist`)

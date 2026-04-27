@@ -4,6 +4,32 @@ All notable changes to this project are documented in this file.
 
 The format is inspired by Keep a Changelog and Semantic Versioning.
 
+## [1.3.0] - 2026-04-27
+
+### Added
+
+- Advanced admin panel visuals:
+  - Status-class chart (2xx/3xx/4xx/5xx)
+  - Latency percentile chart (p50/p90/p99 from recent requests)
+- New admin API endpoints:
+  - `GET /api/settings`
+  - `POST /api/settings`
+  - `POST /api/settings/persist`
+  - `POST /api/cache/clear`
+  - `POST /api/route-rules/reload`
+- Optional scoped admin tokens via `admin_token_scopes` (`read`, `write`, `admin`).
+
+### Changed
+
+- Dashboard actions now include runtime apply plus persistent config save.
+- `/api/summary` includes live runtime settings metadata for panel sync.
+- Version bumped to `1.3.0`.
+
+### Docs
+
+- EN/FA docs updated for advanced admin panel, scoped token permissions, and new API endpoints.
+- Release references updated to `RELEASE_NOTES_v1.3.0.md`.
+
 ## [1.2.0] - 2026-04-27
 
 ### Added
@@ -44,4 +70,3 @@ The format is inspired by Keep a Changelog and Semantic Versioning.
 ## [1.1.0] - Previous
 
 - Baseline v1 feature set prior to 1.2.0 improvements.
-

@@ -8,7 +8,7 @@ Domain-fronted local proxy with Apps Script relay, Telegram Desktop compatibilit
 - **English Index:** [`docs/en/INDEX.md`](docs/en/INDEX.md)
 - **Farsi Index:** [`docs/fa/INDEX.md`](docs/fa/INDEX.md)
 - **Changelog:** [`CHANGELOG.md`](CHANGELOG.md)
-- **v1.2.0 Release Notes:** [`RELEASE_NOTES_v1.2.0.md`](RELEASE_NOTES_v1.2.0.md)
+- **v1.3.0 Release Notes:** [`RELEASE_NOTES_v1.3.0.md`](RELEASE_NOTES_v1.3.0.md)
 
 ## Quick Start
 

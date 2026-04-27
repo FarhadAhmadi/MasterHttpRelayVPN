@@ -20,6 +20,11 @@
 	"admin_host": "127.0.0.1",
 	"admin_port": 9090,
 	"admin_token": "",
+	"admin_token_scopes": {
+		"viewer-token-example": ["read"],
+		"operator-token-example": ["write"],
+		"owner-token-example": ["admin"]
+	},
 	"metrics_max_recent_events": 2000,
 	"metrics_bucket_seconds": 60,
 	"metrics_max_buckets": 180,

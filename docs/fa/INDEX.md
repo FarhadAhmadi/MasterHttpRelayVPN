@@ -22,4 +22,4 @@
 - README فارسی: [`README_FA.md`](../../README_FA.md)
 - English docs index: [`docs/en/INDEX.md`](../en/INDEX.md)
 - تغییرات نسخه‌ها: [`CHANGELOG.md`](../../CHANGELOG.md)
-- Release Notes نسخه 1.2.0: [`RELEASE_NOTES_v1.2.0.md`](../../RELEASE_NOTES_v1.2.0.md)
+- Release Notes نسخه 1.3.0: [`RELEASE_NOTES_v1.3.0.md`](../../RELEASE_NOTES_v1.3.0.md)

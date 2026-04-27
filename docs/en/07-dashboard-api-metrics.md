@@ -13,13 +13,21 @@ Shows:
 - recent requests
 - route decision counters
 - live chart
+- status-class chart
+- latency percentile chart (from recent events)
 - self-heal auto-tune event counters
+- runtime settings controls (live apply + save to config)
 
 ## API Endpoints
 
 - `GET /api/summary`
+- `GET /api/settings`
+- `POST /api/settings`
+- `POST /api/settings/persist`
 - `GET /api/top-hosts?limit=20`
 - `GET /api/recent.csv`
+- `POST /api/cache/clear`
+- `POST /api/route-rules/reload`
 - `POST /api/reset`
 - `GET /healthz`
 
@@ -55,3 +63,9 @@ If `admin_token` is set, include:
 ```http
 X-Admin-Token: your_token
 ```
+
+If `admin_token_scopes` is set, tokens can be scoped:
+
+- `read`: dashboard, summary, metrics, CSV, health
+- `write`: read + runtime mutations (`/api/settings`, reset/cache/rules actions)
+- `admin`: write + persistent config save (`/api/settings/persist`)
