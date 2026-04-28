@@ -37,3 +37,6 @@ domainfront_certs_*/
 
 # Runtime telemetry/log output
 logs/
+
+
+configs\scriptIds.txt
