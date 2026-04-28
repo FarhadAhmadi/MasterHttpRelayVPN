@@ -13,11 +13,15 @@ import json
 import logging
 import os
 import re
+import secrets
 import socket
 import ssl
 import time
 import ipaddress
+import io
+import zipfile
 from collections import Counter
+from collections import OrderedDict
 from fnmatch import fnmatch
 from urllib.parse import urlparse
 
@@ -98,7 +102,7 @@ class ResponseCache:
     """Simple LRU response cache — avoids repeated relay calls."""
 
     def __init__(self, max_mb: int = 50):
-        self._store: dict[str, tuple[bytes, float]] = {}
+        self._store: "OrderedDict[str, tuple[bytes, float]]" = OrderedDict()
         self._size = 0
         self._max = max_mb * 1024 * 1024
         self.hits = 0
@@ -115,6 +119,8 @@ class ResponseCache:
             del self._store[url]
             self.misses += 1
             return None
+        # LRU promotion on read keeps hot assets in cache longer.
+        self._store.move_to_end(url)
         self.hits += 1
         return raw
 
@@ -124,11 +130,12 @@ class ResponseCache:
             return
         # Evict oldest to make room
         while self._size + size > self._max and self._store:
-            oldest = next(iter(self._store))
-            self._size -= len(self._store[oldest][0])
-            del self._store[oldest]
+            oldest, (old_raw, _) = self._store.popitem(last=False)
+            _ = oldest
+            self._size -= len(old_raw)
         if url in self._store:
             self._size -= len(self._store[url][0])
+            del self._store[url]
         self._store[url] = (raw_response, time.time() + ttl)
         self._size += size
 
@@ -254,10 +261,31 @@ class ProxyServer:
         self._admin_port = self._cfg_int(
             config, "admin_port", 9090, minimum=1,
         )
+        self._admin_force_loopback = bool(config.get("admin_force_loopback", False))
+        self._admin_csrf_enabled = bool(config.get("admin_csrf_enabled", True))
+        self._admin_csrf_token = secrets.token_urlsafe(24)
         self._admin_token = str(config.get("admin_token", "")).strip()
         self._admin_token_scopes = self._normalize_admin_token_scopes(
             config.get("admin_token_scopes", {})
         )
+        self._admin_auth_failures: dict[str, list[float]] = {}
+        self._admin_auth_window_s = self._cfg_int(
+            config, "admin_auth_window_s", 120, minimum=10,
+        )
+        self._admin_auth_max_failures = self._cfg_int(
+            config, "admin_auth_max_failures", 12, minimum=3,
+        )
+        self._watchdog_enabled = bool(config.get("watchdog_enabled", True))
+        self._watchdog_probe_interval_s = self._cfg_int(
+            config, "watchdog_probe_interval_s", 30, minimum=5,
+        )
+        self._watchdog_failure_threshold = self._cfg_int(
+            config, "watchdog_failure_threshold", 4, minimum=1,
+        )
+        self._watchdog_task: asyncio.Task | None = None
+        # Keep the process alive while allowing traffic to be paused/resumed
+        # from the admin panel with a single toggle.
+        self._service_enabled = bool(config.get("proxy_service_enabled_on_start", True))
         self._proxy_auth_enabled = bool(config.get("proxy_auth_enabled", False))
         self._proxy_username = str(config.get("proxy_username", ""))
         self._proxy_password = str(config.get("proxy_password", ""))
@@ -341,6 +369,16 @@ class ProxyServer:
                 "telegram_desktop_mode enabled — SOCKS IP-literal flows fail fast "
                 "on blocked DCs so Telegram can rotate endpoints quicker"
             )
+        if self._admin_enabled:
+            if self._admin_force_loopback and not self._is_loopback_host(self._admin_host):
+                raise ValueError(
+                    "Refusing to start: admin_force_loopback=true but admin_host is not loopback."
+                )
+            if not self._is_loopback_host(self._admin_host):
+                log.warning(
+                    "Admin dashboard is exposed on %s. Prefer 127.0.0.1 or enable admin_force_loopback.",
+                    self._admin_host,
+                )
 
         try:
             from mitm import MITMCertManager
@@ -456,6 +494,61 @@ class ProxyServer:
         if task is not None:
             self._client_tasks.discard(task)
 
+    async def _set_service_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self._service_enabled == enabled:
+            return
+        self._service_enabled = enabled
+        if enabled:
+            return
+        # Turning service OFF should drop active proxy sessions immediately,
+        # not only block new connections.
+        current = asyncio.current_task()
+        active = [task for task in self._client_tasks if task is not current]
+        for task in active:
+            task.cancel()
+        if active:
+            await asyncio.gather(*active, return_exceptions=True)
+
+    async def _quick_relay_probe(self) -> dict[str, object]:
+        started = time.perf_counter()
+        try:
+            raw = await asyncio.wait_for(
+                self.fronter.relay("HEAD", "http://example.com/", {}, b""),
+                timeout=8.0,
+            )
+            status, _, _ = self.fronter._split_raw_response(raw)
+            ms = int((time.perf_counter() - started) * 1000)
+            return {"ok": 200 <= status < 500, "status": status, "latency_ms": ms}
+        except Exception as exc:
+            ms = int((time.perf_counter() - started) * 1000)
+            return {"ok": False, "error": str(exc), "latency_ms": ms}
+
+    async def _watchdog_loop(self) -> None:
+        failures = 0
+        while True:
+            try:
+                await asyncio.sleep(self._watchdog_probe_interval_s)
+                probe = await self._quick_relay_probe()
+                if probe.get("ok"):
+                    failures = 0
+                    continue
+                failures += 1
+                log.warning(
+                    "Watchdog probe failed (%d/%d): %s",
+                    failures,
+                    self._watchdog_failure_threshold,
+                    probe,
+                )
+                if failures >= self._watchdog_failure_threshold:
+                    failures = 0
+                    log.warning("Watchdog reconnect: recycling relay connections")
+                    await self.fronter.close()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.debug("watchdog loop error: %s", exc)
+
     @staticmethod
     def _parse_headers_from_block(header_block: bytes) -> dict[str, str]:
         headers = {}
@@ -521,6 +614,64 @@ class ProxyServer:
         except Exception as exc:
             log.warning("Could not load route rules file %s: %s", path, exc)
         return rules
+
+    def _read_route_rules_text(self) -> str:
+        path = self._route_rules_file
+        if not path or not os.path.exists(path):
+            return ""
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    @staticmethod
+    def _parse_route_rules_text(raw_text: str) -> tuple[list[tuple[str, str]], list[str]]:
+        rules: list[tuple[str, str]] = []
+        errors: list[str] = []
+        for line_no, raw in enumerate(raw_text.splitlines(), start=1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "->" not in line:
+                errors.append(f"line {line_no}: missing '->'")
+                continue
+            pat, action = [x.strip().lower() for x in line.split("->", 1)]
+            if not pat:
+                errors.append(f"line {line_no}: empty pattern")
+                continue
+            if action not in {"direct", "relay", "block", "bypass"}:
+                errors.append(f"line {line_no}: invalid action '{action}'")
+                continue
+            rules.append((pat, action))
+        return rules, errors
+
+    def _route_rule_action_from_rules(self, host: str,
+                                      rules: list[tuple[str, str]]) -> str | None:
+        h = host.lower().rstrip(".")
+        chosen = None
+        chosen_len = -1
+        for pattern, action in rules:
+            p = pattern.lower().rstrip(".")
+            if p == "*":
+                if chosen is None:
+                    chosen = action
+                continue
+            if p.startswith("*."):
+                suffix = p[1:]
+                if h.endswith(suffix) and len(p) > chosen_len:
+                    chosen = action
+                    chosen_len = len(p)
+                continue
+            if p.startswith("."):
+                if h.endswith(p) and len(p) > chosen_len:
+                    chosen = action
+                    chosen_len = len(p)
+                continue
+            if fnmatch(h, p) and len(p) > chosen_len:
+                chosen = action
+                chosen_len = len(p)
+            elif h == p and len(p) > chosen_len:
+                chosen = action
+                chosen_len = len(p)
+        return chosen
 
     def _route_rule_action(self, host: str) -> str | None:
         if not self._route_rules:
@@ -615,6 +766,16 @@ class ProxyServer:
                 return True
         return False
 
+    @staticmethod
+    def _is_loopback_host(host: str) -> bool:
+        h = str(host).strip().lower()
+        if h in {"localhost", "127.0.0.1", "::1"}:
+            return True
+        try:
+            return ipaddress.ip_address(h).is_loopback
+        except ValueError:
+            return False
+
     def _is_blocked(self, host: str) -> bool:
         return self._host_matches_rules(host, self._block_hosts)
 
@@ -638,6 +799,27 @@ class ProxyServer:
             if self._header_value(headers, name):
                 return False
         return self.fronter._is_static_asset_url(url)
+
+    def _cache_key(self, method: str, url: str, headers: dict | None) -> str:
+        enc = self._header_value(headers, "accept-encoding").lower().strip()
+        # Keep cache variants separated by content encoding expectations.
+        return f"{method.upper()}|{url}|ae={enc}"
+
+    def _admin_auth_limited(self, remote_ip: str) -> bool:
+        now = time.time()
+        window_start = now - float(self._admin_auth_window_s)
+        bucket = [ts for ts in self._admin_auth_failures.get(remote_ip, []) if ts >= window_start]
+        self._admin_auth_failures[remote_ip] = bucket
+        return len(bucket) >= self._admin_auth_max_failures
+
+    def _record_admin_auth_failure(self, remote_ip: str) -> None:
+        now = time.time()
+        bucket = self._admin_auth_failures.get(remote_ip, [])
+        bucket.append(now)
+        self._admin_auth_failures[remote_ip] = bucket
+
+    def _clear_admin_auth_failures(self, remote_ip: str) -> None:
+        self._admin_auth_failures.pop(remote_ip, None)
 
     @classmethod
     def _should_trace_host(cls, host: str) -> bool:
@@ -752,6 +934,13 @@ class ProxyServer:
                 "Admin dashboard listening on http://%s:%d",
                 self._admin_host, self._admin_port,
             )
+        if self._watchdog_enabled:
+            self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+            log.info(
+                "Watchdog enabled: interval=%ss threshold=%s",
+                self._watchdog_probe_interval_s,
+                self._watchdog_failure_threshold,
+            )
 
         try:
             async with http_srv:
@@ -782,6 +971,13 @@ class ProxyServer:
 
     async def stop(self):
         """Shut down all listeners and release relay resources."""
+        if self._watchdog_task is not None:
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except Exception:
+                pass
+            self._watchdog_task = None
         for srv in self._servers:
             try:
                 srv.close()
@@ -851,6 +1047,16 @@ class ProxyServer:
                     b"Proxy-Authenticate: Basic realm=\"MasterHttpRelayVPN\"\r\n"
                     b"Connection: close\r\n"
                     b"Content-Length: 0\r\n\r\n"
+                )
+                await writer.drain()
+                return
+            if not self._service_enabled:
+                writer.write(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Content-Type: text/plain; charset=utf-8\r\n"
+                    b"Connection: close\r\n"
+                    b"Content-Length: 52\r\n\r\n"
+                    b"MasterHttpRelayVPN is OFF. Enable it from admin panel."
                 )
                 await writer.drain()
                 return
@@ -949,6 +1155,10 @@ class ProxyServer:
 
             port_raw = await asyncio.wait_for(reader.readexactly(2), timeout=10)
             port = int.from_bytes(port_raw, "big")
+            if not self._service_enabled:
+                writer.write(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
+                await writer.drain()
+                return
 
             log.info("SOCKS5 CONNECT → %s:%d", host, port)
             await self._handle_socks_target_tunnel(host, port, reader, writer)
@@ -1759,8 +1969,9 @@ class ProxyServer:
                 response = None
                 cache_hit = False
                 relay_error_name = ""
+                cache_key = self._cache_key(method, url, headers)
                 if self._cache_allowed(method, url, headers, body):
-                    response = self._cache.get(url)
+                    response = self._cache.get(cache_key)
                     if response:
                         log.debug("Cache HIT: %s", url[:60])
                         cache_hit = True
@@ -1785,7 +1996,7 @@ class ProxyServer:
                     if self._cache_allowed(method, url, headers, body) and response:
                         ttl = ResponseCache.parse_ttl(response, url)
                         if ttl > 0:
-                            self._cache.put(url, response, ttl)
+                            self._cache.put(cache_key, response, ttl)
                             log.debug("Cached (%ds): %s", ttl, url[:60])
 
                 # Inject permissive CORS headers whenever the browser sent
@@ -2020,8 +2231,9 @@ class ProxyServer:
         # Cache check for GET
         response = None
         cache_hit = False
+        cache_key = self._cache_key(method, url, headers)
         if self._cache_allowed(method, url, headers, body):
-            response = self._cache.get(url)
+            response = self._cache.get(cache_key)
             if response:
                 log.debug("Cache HIT (HTTP): %s", url[:60])
                 cache_hit = True
@@ -2042,7 +2254,7 @@ class ProxyServer:
             if self._cache_allowed(method, url, headers, body) and response:
                 ttl = ResponseCache.parse_ttl(response, url)
                 if ttl > 0:
-                    self._cache.put(url, response, ttl)
+                    self._cache.put(cache_key, response, ttl)
 
         if origin and response:
             response = self._inject_cors_headers(response, origin)
@@ -2111,6 +2323,8 @@ class ProxyServer:
                                writer: asyncio.StreamWriter):
         task = self._track_current_task()
         try:
+            peer = writer.get_extra_info("peername") or ("unknown", 0)
+            remote_ip = str(peer[0]) if isinstance(peer, tuple) and peer else "unknown"
             first = await asyncio.wait_for(reader.readline(), timeout=10)
             if not first:
                 return
@@ -2147,14 +2361,38 @@ class ProxyServer:
                 await writer.drain()
                 return
 
+            if self._admin_auth_limited(remote_ip):
+                writer.write(
+                    b"HTTP/1.1 429 Too Many Requests\r\n"
+                    b"Retry-After: 60\r\n"
+                    b"Content-Length: 0\r\n\r\n"
+                )
+                await writer.drain()
+                return
+
             auth_ok, scopes = self._admin_auth(headers.get("x-admin-token", ""))
             if not auth_ok:
+                self._record_admin_auth_failure(remote_ip)
                 writer.write(
                     b"HTTP/1.1 401 Unauthorized\r\n"
                     b"Content-Length: 0\r\n\r\n"
                 )
                 await writer.drain()
                 return
+            self._clear_admin_auth_failures(remote_ip)
+            if method == "POST" and self._admin_csrf_enabled:
+                # Require CSRF token for browser-like admin POSTs.
+                csrf_token = headers.get("x-csrf-token", "")
+                has_browser_headers = bool(headers.get("origin") or headers.get("referer"))
+                if has_browser_headers and not hmac.compare_digest(
+                    csrf_token, self._admin_csrf_token
+                ):
+                    writer.write(
+                        b"HTTP/1.1 403 Forbidden\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
 
             if path == "/" or path.startswith("/?"):
                 if not self._admin_has_scope(scopes, "read"):
@@ -2205,6 +2443,10 @@ class ProxyServer:
                     "count": len(self._route_rules),
                 }
                 snap["settings"] = self._admin_runtime_settings()
+                snap["runtime"] = {
+                    "service_enabled": self._service_enabled,
+                    "active_sessions": max(0, len(self._client_tasks) - 1),
+                }
                 writer.write(TelemetryStore.json_response(snap))
                 await writer.drain()
                 return
@@ -2253,6 +2495,54 @@ class ProxyServer:
                     "ok": not errors,
                     "errors": errors,
                     "settings": self._admin_runtime_settings(),
+                }))
+                await writer.drain()
+                return
+
+            if path.startswith("/api/service"):
+                if method == "GET":
+                    if not self._admin_has_scope(scopes, "read"):
+                        writer.write(
+                            b"HTTP/1.1 403 Forbidden\r\n"
+                            b"Content-Length: 0\r\n\r\n"
+                        )
+                        await writer.drain()
+                        return
+                    writer.write(TelemetryStore.json_response({
+                        "enabled": self._service_enabled,
+                    }))
+                    await writer.drain()
+                    return
+                if not self._admin_has_scope(scopes, "write"):
+                    writer.write(
+                        b"HTTP/1.1 403 Forbidden\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
+                payload = {}
+                if body_data:
+                    try:
+                        payload = json.loads(body_data.decode("utf-8", errors="replace"))
+                    except Exception:
+                        writer.write(
+                            b"HTTP/1.1 400 Bad Request\r\n"
+                            b"Content-Length: 0\r\n\r\n"
+                        )
+                        await writer.drain()
+                        return
+                enabled = payload.get("enabled")
+                if not isinstance(enabled, bool):
+                    writer.write(TelemetryStore.json_response({
+                        "ok": False,
+                        "error": "enabled must be boolean",
+                    }))
+                    await writer.drain()
+                    return
+                await self._set_service_enabled(enabled)
+                writer.write(TelemetryStore.json_response({
+                    "ok": True,
+                    "enabled": self._service_enabled,
                 }))
                 await writer.drain()
                 return
@@ -2378,6 +2668,93 @@ class ProxyServer:
                 await writer.drain()
                 return
 
+            if path.startswith("/api/route-rules/test"):
+                if method != "POST":
+                    writer.write(
+                        b"HTTP/1.1 405 Method Not Allowed\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
+                if not self._admin_has_scope(scopes, "write"):
+                    writer.write(
+                        b"HTTP/1.1 403 Forbidden\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
+                payload = {}
+                if body_data:
+                    try:
+                        payload = json.loads(body_data.decode("utf-8", errors="replace"))
+                    except Exception:
+                        payload = {}
+                host = str(payload.get("host", "")).strip().lower()
+                if not host:
+                    writer.write(TelemetryStore.json_response({"ok": False, "error": "host is required"}))
+                    await writer.drain()
+                    return
+                action = self._route_rule_action_from_rules(host, self._route_rules) or "relay"
+                writer.write(TelemetryStore.json_response({"ok": True, "host": host, "action": action}))
+                await writer.drain()
+                return
+
+            if path.startswith("/api/route-rules"):
+                if method == "GET":
+                    if not self._admin_has_scope(scopes, "read"):
+                        writer.write(
+                            b"HTTP/1.1 403 Forbidden\r\n"
+                            b"Content-Length: 0\r\n\r\n"
+                        )
+                        await writer.drain()
+                        return
+                    text = self._read_route_rules_text()
+                    writer.write(TelemetryStore.json_response({
+                        "ok": True,
+                        "file": self._route_rules_file,
+                        "text": text,
+                        "count": len(self._route_rules),
+                    }))
+                    await writer.drain()
+                    return
+                if method != "POST":
+                    writer.write(
+                        b"HTTP/1.1 405 Method Not Allowed\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
+                if not self._admin_has_scope(scopes, "write"):
+                    writer.write(
+                        b"HTTP/1.1 403 Forbidden\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
+                payload = {}
+                if body_data:
+                    try:
+                        payload = json.loads(body_data.decode("utf-8", errors="replace"))
+                    except Exception:
+                        payload = {}
+                text = str(payload.get("text", ""))
+                rules, errors = self._parse_route_rules_text(text)
+                if errors:
+                    writer.write(TelemetryStore.json_response({"ok": False, "errors": errors[:20]}))
+                    await writer.drain()
+                    return
+                path_out = self._route_rules_file or "route_rules.txt"
+                with open(path_out, "w", encoding="utf-8") as f:
+                    f.write(text.rstrip() + "\n")
+                self._route_rules = rules
+                writer.write(TelemetryStore.json_response({
+                    "ok": True,
+                    "file": path_out,
+                    "count": len(self._route_rules),
+                }))
+                await writer.drain()
+                return
+
             if path.startswith("/api/route-rules/reload"):
                 if method != "POST":
                     writer.write(
@@ -2425,6 +2802,95 @@ class ProxyServer:
                 await writer.drain()
                 return
 
+            if path.startswith("/api/quick-action"):
+                if method != "POST":
+                    writer.write(
+                        b"HTTP/1.1 405 Method Not Allowed\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
+                if not self._admin_has_scope(scopes, "write"):
+                    writer.write(
+                        b"HTTP/1.1 403 Forbidden\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
+                payload = {}
+                if body_data:
+                    try:
+                        payload = json.loads(body_data.decode("utf-8", errors="replace"))
+                    except Exception:
+                        payload = {}
+                action = str(payload.get("action", "")).strip().lower()
+                if action == "optimize":
+                    self._self_heal_enabled = True
+                    self._telegram_desktop_mode = True
+                    self._download_max_parallel = max(6, self._download_max_parallel)
+                    writer.write(TelemetryStore.json_response({
+                        "ok": True,
+                        "action": action,
+                        "message": "Applied recommended runtime settings",
+                        "settings": self._admin_runtime_settings(),
+                    }))
+                    await writer.drain()
+                    return
+                if action == "panic_off":
+                    await self._set_service_enabled(False)
+                    self._cache.clear(reset_stats=False)
+                    writer.write(TelemetryStore.json_response({
+                        "ok": True,
+                        "action": action,
+                        "message": "Traffic blocked and active sessions closed",
+                        "enabled": self._service_enabled,
+                    }))
+                    await writer.drain()
+                    return
+                if action == "probe_relay":
+                    probe = await self._quick_relay_probe()
+                    writer.write(TelemetryStore.json_response({
+                        "ok": bool(probe.get("ok")),
+                        "action": action,
+                        "probe": probe,
+                    }))
+                    await writer.drain()
+                    return
+                writer.write(TelemetryStore.json_response({
+                    "ok": False,
+                    "error": "unknown action",
+                }))
+                await writer.drain()
+                return
+
+            if path.startswith("/api/diagnostics/bundle"):
+                if not self._admin_has_scope(scopes, "read"):
+                    writer.write(
+                        b"HTTP/1.1 403 Forbidden\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
+                snap = await self._telemetry.snapshot(top_hosts=40, recent_limit=200)
+                settings = self._admin_runtime_settings()
+                csv_body = await self._telemetry.recent_csv(limit=1000)
+                buf = io.BytesIO()
+                with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                    zf.writestr("summary.json", json.dumps(snap, indent=2))
+                    zf.writestr("settings.json", json.dumps(settings, indent=2))
+                    zf.writestr("route_rules.txt", self._read_route_rules_text())
+                    zf.writestr("recent.csv", csv_body)
+                data = buf.getvalue()
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/zip\r\n"
+                    b"Cache-Control: no-store\r\n"
+                    b"Content-Disposition: attachment; filename=\"mhrvpn_diagnostics.zip\"\r\n"
+                    b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n" + data
+                )
+                await writer.drain()
+                return
+
             if path.startswith("/healthz"):
                 if not self._admin_has_scope(scopes, "read"):
                     writer.write(
@@ -2460,6 +2926,7 @@ class ProxyServer:
     def _admin_runtime_settings(self) -> dict[str, object]:
         return {
             "self_heal_enabled": self._self_heal_enabled,
+            "service_enabled": self._service_enabled,
             "telegram_desktop_mode": self._telegram_desktop_mode,
             "download_max_parallel": self._download_max_parallel,
             "metrics_hash_hosts": self._telemetry._hash_hosts,
@@ -2474,6 +2941,13 @@ class ProxyServer:
                 if self._admin_token_scopes else
                 ("single_token" if self._admin_token else "disabled")
             ),
+            "admin_auth_window_s": self._admin_auth_window_s,
+            "admin_auth_max_failures": self._admin_auth_max_failures,
+            "admin_force_loopback": self._admin_force_loopback,
+            "admin_csrf_enabled": self._admin_csrf_enabled,
+            "watchdog_enabled": self._watchdog_enabled,
+            "watchdog_probe_interval_s": self._watchdog_probe_interval_s,
+            "watchdog_failure_threshold": self._watchdog_failure_threshold,
         }
 
     def _apply_admin_settings(self, payload: dict[str, object]) -> list[str]:
@@ -2544,8 +3018,7 @@ class ProxyServer:
         except Exception as exc:
             return False, str(exc)
 
-    @staticmethod
-    def _admin_html() -> str:
+    def _admin_html(self) -> str:
         return """<!doctype html>
 <html>
 <head>
@@ -2554,18 +3027,26 @@ class ProxyServer:
   <title>MasterHttpRelayVPN Admin Panel</title>
   <style>
     :root{--bg:#071021;--bg2:#0d172c;--card:#111d35;--stroke:#223555;--text:#e2ebff;--muted:#8fa7cf;--accent:#39c6ff;--accent2:#5ee1a2;--warn:#f6b949;--bad:#ff6b7d;}
-    *{box-sizing:border-box}body{margin:0;color:var(--text);font-family:system-ui,Segoe UI,Arial;background:radial-gradient(circle at 8% 0,#162a4e 0,#071021 45%,#050c18 100%);}
+    *{box-sizing:border-box}body{margin:0;color:var(--text);font-family:"Trebuchet MS","Segoe UI",Tahoma,sans-serif;background:radial-gradient(circle at 8% 0,#162a4e 0,#071021 45%,#050c18 100%);position:relative;overflow-x:hidden}
+    body::before,body::after{content:"";position:fixed;width:360px;height:360px;border-radius:50%;filter:blur(40px);opacity:.25;z-index:-1;animation:floatBlob 14s ease-in-out infinite}
+    body::before{top:-120px;left:-90px;background:radial-gradient(circle,#2e68ba 0,#12325d 55%,transparent 72%)}
+    body::after{right:-120px;bottom:-140px;background:radial-gradient(circle,#2a8868 0,#124336 55%,transparent 72%);animation-delay:-5s}
     .wrap{max-width:1400px;margin:0 auto;padding:16px}
     .top{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center}
     h1{margin:0;font-size:23px;letter-spacing:.3px}
     .label{color:var(--muted);font-size:12px}
     .chip{padding:6px 10px;border:1px solid var(--stroke);border-radius:999px;background:#0c1830}
     .toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}
+    .guide{margin-top:8px;padding:8px 10px;border:1px dashed #2b4268;border-radius:10px;background:#081428;color:var(--muted);font-size:12px}
+    .pill{padding:6px 10px;border-radius:999px;border:1px solid var(--stroke);font-size:12px}
+    .pill.on{background:#133727;border-color:#245c3f;color:#8df0b9}
+    .pill.off{background:#3d1723;border-color:#6f2b3d;color:#ff9cad}
     .toolbar input,.toolbar select,.settings input,.settings select{background:#091327;border:1px solid var(--stroke);color:var(--text);padding:7px 10px;border-radius:8px}
     button{background:#183157;border:1px solid #2a4a77;color:var(--text);padding:7px 11px;border-radius:8px;cursor:pointer}
     button:hover{background:#21406f}.ghost{background:#101b33;border-color:var(--stroke)}
     .grid{margin-top:10px;display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}
-    .card{background:linear-gradient(180deg,var(--card),#0f1b33);border:1px solid var(--stroke);border-radius:12px;padding:12px}
+    .card{background:linear-gradient(180deg,var(--card),#0f1b33);border:1px solid var(--stroke);border-radius:12px;padding:12px;transition:transform .22s ease,box-shadow .22s ease,border-color .22s ease}
+    .card:hover{transform:translateY(-2px);border-color:#36598c;box-shadow:0 12px 26px rgba(4,10,22,.35)}
     .value{font-size:21px;font-weight:700;margin-top:3px}
     .panes{margin-top:10px;display:grid;grid-template-columns:2.3fr 1fr;gap:10px}
     .subgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
@@ -2575,14 +3056,41 @@ class ProxyServer:
     .footer{margin-top:10px;font-size:12px;color:var(--muted)}
     a{color:var(--accent)}
     svg{width:100%;height:190px;background:#091327;border-radius:8px}
+    .timeline{position:relative;overflow:hidden;background:radial-gradient(circle at 12% 0,#1a355e 0,#0d1d36 40%,#0a152a 100%);box-shadow:inset 0 0 0 1px #2a4367,inset 0 -25px 40px rgba(8,16,30,.5)}
+    .timeline::before{content:"";position:absolute;inset:-120% -30%;background:conic-gradient(from 0deg at 50% 50%,rgba(57,198,255,.0),rgba(57,198,255,.14),rgba(94,225,162,.08),rgba(57,198,255,.0));animation:spinGlow 12s linear infinite;pointer-events:none}
+    .timeline .panel{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+    .timeline-tools{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}
+    .timeline-tools select,.timeline-tools label{font-size:12px;color:var(--muted)}
+    .timeline-metrics{margin-top:8px;display:grid;grid-template-columns:repeat(3,minmax(120px,1fr));gap:8px}
+    .timeline-stat{background:rgba(8,18,36,.75);border:1px solid #274069;border-radius:9px;padding:7px 8px;position:relative;overflow:hidden;transition:transform .2s ease,border-color .2s ease}
+    .timeline-stat:hover{transform:translateY(-2px);border-color:#3d699f}
+    .timeline-stat::after{content:"";position:absolute;inset:0;background:linear-gradient(115deg,transparent 25%,rgba(255,255,255,.08) 45%,transparent 62%);transform:translateX(-140%);animation:shimmer 6.8s ease-in-out infinite}
+    .timeline-stat .k{display:block;font-size:11px;color:var(--muted)}
+    .timeline-stat .v{font-size:14px;font-weight:700}
+    .axis-label{font-size:10px;fill:#8fa7cf}
+    .up{color:#6ff3be}.down{color:#ff93a0}
+    #chart{position:relative;z-index:1}
+    #chart .gridline{animation:gridIn .6s ease both}
+    #chart .series-area{animation:fadeIn .5s ease both}
+    #chart .series-line{stroke-dasharray:1100;stroke-dashoffset:1100;animation:lineIn .9s cubic-bezier(.16,.92,.35,1) forwards}
+    .pulse{animation:pulseVal .55s ease}
+    @keyframes lineIn{to{stroke-dashoffset:0}}
+    @keyframes fadeIn{from{opacity:0}to{opacity:.13}}
+    @keyframes gridIn{from{opacity:0}to{opacity:1}}
+    @keyframes shimmer{0%,82%,100%{transform:translateX(-140%)}90%{transform:translateX(140%)}}
+    @keyframes spinGlow{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+    @keyframes floatBlob{0%,100%{transform:translateY(0)}50%{transform:translateY(22px)}}
+    @keyframes pulseVal{0%{transform:scale(1)}45%{transform:scale(1.08)}100%{transform:scale(1)}}
     .legend{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px}
     .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px;vertical-align:middle}
     .settings label{display:block;font-size:12px;color:var(--muted);margin-bottom:3px}
+    textarea{width:100%;min-height:150px;background:#091327;border:1px solid var(--stroke);color:var(--text);padding:8px;border-radius:8px;font-family:Consolas,ui-monospace,monospace;font-size:12px}
     .settings-row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:8px 0}
     .switches{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:8px}
     .switches label{display:flex;align-items:center;gap:6px;color:var(--text)}
     #toast{position:fixed;right:14px;bottom:14px;background:#102241;border:1px solid var(--stroke);padding:9px 12px;border-radius:8px;opacity:0;transition:opacity .2s ease}
     #toast.show{opacity:1}
+    .actions{margin-top:10px;display:flex;gap:8px;flex-wrap:wrap}
     @media(max-width:1180px){.panes{grid-template-columns:1fr}.subgrid{grid-template-columns:1fr}}
   </style>
 </head>
@@ -2605,14 +3113,40 @@ class ProxyServer:
       <button class="ghost" id="btnRefresh">Refresh now</button>
       <button class="ghost" id="btnCsv">CSV</button>
       <button class="ghost" id="btnJson">JSON</button>
+      <button id="btnToggleService">Turn VPN Off</button>
+      <span class="pill on" id="serviceState">VPN ON</span>
+    </div>
+    <div class="guide">Quick use: keep this page open and use <b>Turn VPN On/Off</b>. OFF keeps dashboard online but blocks new proxy traffic.</div>
+    <div class="actions">
+      <button class="ghost" id="btnOptimize">One-click optimize</button>
+      <button class="ghost" id="btnProbeRelay">Relay probe</button>
+      <button class="ghost" id="btnPanicOff">Panic OFF</button>
     </div>
     <div class="grid" id="cards"></div>
-    <div class="card" style="margin-top:10px">
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+    <div class="card timeline" style="margin-top:10px">
+      <div class="panel">
         <strong>Traffic Timeline</strong>
         <span class="label" id="chartSummary">-</span>
       </div>
+      <div class="timeline-tools">
+        <select id="chartWindow">
+          <option value="30">Last 30</option>
+          <option value="60" selected>Last 60</option>
+          <option value="120">Last 120</option>
+          <option value="0">All buckets</option>
+        </select>
+        <label><input id="chartAvg" type="checkbox" checked /> moving average</label>
+        <label><input id="chartNorm" type="checkbox" /> normalize scale</label>
+      </div>
       <svg id="chart" viewBox="0 0 980 190"></svg>
+      <div class="timeline-metrics">
+        <div class="timeline-stat"><span class="k">Peak Requests</span><span class="v" id="peakReq">-</span></div>
+        <div class="timeline-stat"><span class="k">Peak Errors</span><span class="v" id="peakErr">-</span></div>
+        <div class="timeline-stat"><span class="k">Peak Download</span><span class="v" id="peakDown">-</span></div>
+        <div class="timeline-stat"><span class="k">Req Trend</span><span class="v" id="reqTrend">-</span></div>
+        <div class="timeline-stat"><span class="k">Error Spikes</span><span class="v" id="errSpike">-</span></div>
+        <div class="timeline-stat"><span class="k">Bucket Count</span><span class="v" id="bucketCount">-</span></div>
+      </div>
       <div class="legend">
         <span><span class="dot" style="background:#39c6ff"></span>requests</span>
         <span><span class="dot" style="background:#ff6b7d"></span>errors</span>
@@ -2650,8 +3184,19 @@ class ProxyServer:
           <button id="btnSaveSettings">Save settings</button>
           <button id="btnSaveSettingsDisk">Save to config</button>
           <button class="ghost" id="btnReloadRules">Reload route rules</button>
+          <button class="ghost" id="btnLoadRules">Load rules text</button>
+          <button class="ghost" id="btnSaveRules">Save rules text</button>
           <button class="ghost" id="btnClearCache">Clear cache</button>
           <button class="ghost" id="btnReset">Reset telemetry</button>
+        </div>
+        <div style="margin-top:8px">
+          <label>Route Rules Editor</label>
+          <textarea id="rulesEditor" placeholder="telegram.org -> direct&#10;*.example.com -> relay"></textarea>
+          <div class="toolbar">
+            <input id="ruleTestHost" placeholder="test host e.g. api.telegram.org" />
+            <button class="ghost" id="btnTestRule">Test host</button>
+            <button class="ghost" id="btnDiagBundle">Download diagnostics</button>
+          </div>
         </div>
         <div class="footer" id="settingsMeta">-</div>
       </div>
@@ -2660,6 +3205,7 @@ class ProxyServer:
   </div>
   <div id="toast"></div>
   <script>
+    const csrfToken=\"__CSRF_TOKEN__\";
     const state={summary:null,timer:null};
     const statusEl=document.getElementById("toast");
     function toast(msg,isErr=false){statusEl.textContent=msg;statusEl.style.borderColor=isErr?"#7a2435":"#225e6a";statusEl.classList.add("show");setTimeout(()=>statusEl.classList.remove("show"),1600);}
@@ -2674,18 +3220,67 @@ class ProxyServer:
       const i=Math.min(a.length-1,Math.max(0,Math.floor((p/100)*(a.length-1))));
       return a[i];
     }
+    function movingAvg(vals,win=4){
+      if(!vals.length)return [];
+      return vals.map((_,i)=>{
+        const s=Math.max(0,i-win+1),part=vals.slice(s,i+1);
+        return part.reduce((a,b)=>a+b,0)/Math.max(1,part.length);
+      });
+    }
+    function visibleTimeline(ts){
+      const all=ts||[];
+      const n=Number(document.getElementById("chartWindow").value||60);
+      return n>0?all.slice(-n):all;
+    }
+    function spikeCount(vals){
+      if(vals.length<2)return 0;
+      let spikes=0;
+      for(let i=1;i<vals.length;i++){ if(vals[i]>=3 && vals[i]>(vals[i-1]*2)) spikes++; }
+      return spikes;
+    }
     function drawChart(ts){
-      const svg=document.getElementById("chart"),w=980,h=190,p=14,data=ts||[];
-      const req=data.map(x=>x.requests||0),err=data.map(x=>x.errors||0),down=data.map(x=>x.resp_bytes||0);
+      const svg=document.getElementById("chart"),w=980,h=190,p=14,data=visibleTimeline(ts);
+      const rawReq=data.map(x=>x.requests||0),rawErr=data.map(x=>x.errors||0),rawDown=data.map(x=>x.resp_bytes||0);
+      const avgOn=document.getElementById("chartAvg").checked,normOn=document.getElementById("chartNorm").checked;
+      const req=avgOn?movingAvg(rawReq):rawReq,err=avgOn?movingAvg(rawErr):rawErr,down=avgOn?movingAvg(rawDown):rawDown;
       const reqOn=document.getElementById("chartReq").checked,errOn=document.getElementById("chartErr").checked,downOn=document.getElementById("chartDown").checked;
-      const maxV=Math.max(1,...(reqOn?req:[0]),...(errOn?err:[0]),...(downOn?down:[0]));
-      let out="";
-      if(reqOn) out+=`<path d="${linePath(req,w,h,p,maxV)}" fill="none" stroke="#39c6ff" stroke-width="2"/>`;
-      if(errOn) out+=`<path d="${linePath(err,w,h,p,maxV)}" fill="none" stroke="#ff6b7d" stroke-width="2"/>`;
-      if(downOn) out+=`<path d="${linePath(down,w,h,p,maxV)}" fill="none" stroke="#5ee1a2" stroke-width="2"/>`;
+      const reqMax=Math.max(1,...req),errMax=Math.max(1,...err),downMax=Math.max(1,...down);
+      const reqPlot=(normOn&&reqOn)?req.map(v=>v/reqMax):req;
+      const errPlot=(normOn&&errOn)?err.map(v=>v/errMax):err;
+      const downPlot=(normOn&&downOn)?down.map(v=>v/downMax):down;
+      const maxV=Math.max(1,...(reqOn?reqPlot:[0]),...(errOn?errPlot:[0]),...(downOn?downPlot:[0]));
+      const grid=[.2,.4,.6,.8].map(g=>`<line class="gridline" x1="${p}" y1="${h-p-(h-2*p)*g}" x2="${w-p}" y2="${h-p-(h-2*p)*g}" stroke="#223b61" stroke-width="1" stroke-dasharray="3 5"/>`).join("");
+      const line=(vals,color)=>`<path class="series-line" d="${linePath(vals,w,h,p,maxV)}" fill="none" stroke="${color}" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>`;
+      const area=(vals,color)=>`<path class="series-area" d="${linePath(vals,w,h,p,maxV)} L ${w-p} ${h-p} L ${p} ${h-p} Z" fill="${color}" opacity="0.13"/>`;
+      let out=`<defs>
+        <filter id="glow"><feDropShadow dx="0" dy="0" stdDeviation="2.4" flood-color="#51d7ff" flood-opacity="0.35"/></filter>
+      </defs>${grid}<text x="${w-p}" y="${p+2}" text-anchor="end" class="axis-label">${normOn?"normalized":"max "+maxV.toFixed(1)}</text>`;
+      if(reqOn){out+=area(reqPlot,"#39c6ff")+line(reqPlot,"#39c6ff")}
+      if(errOn){out+=area(errPlot,"#ff6b7d")+line(errPlot,"#ff6b7d")}
+      if(downOn){out+=area(downPlot,"#5ee1a2")+line(downPlot,"#5ee1a2")}
+      const lastI=Math.max(0,data.length-1),lastX=p+(lastI*(w-2*p)/Math.max(1,data.length-1));
+      out+=`<line x1="${lastX}" y1="${p}" x2="${lastX}" y2="${h-p}" stroke="#385786" stroke-dasharray="4 4"/>`;
+      if(reqOn&&reqPlot.length){
+        const peak=Math.max(...reqPlot),idx=reqPlot.indexOf(peak),x=p+(idx*(w-2*p)/Math.max(1,reqPlot.length-1)),y=h-p-(peak/maxV)*(h-2*p);
+        out+=`<circle cx="${x}" cy="${y}" r="4" fill="#39c6ff" filter="url(#glow)"/>`;
+      }
       svg.innerHTML=out||`<text x="20" y="30" fill="#8fa7cf">enable at least one series</text>`;
       const last=data[data.length-1]||{};
-      document.getElementById("chartSummary").textContent=`last bucket: req ${last.requests||0}, err ${last.errors||0}, down ${fbytes(last.resp_bytes||0)}`;
+      const peakReq=Math.max(0,...rawReq),peakErr=Math.max(0,...rawErr),peakDown=Math.max(0,...rawDown);
+      const trendBase=rawReq[0]||0,trendLast=rawReq[rawReq.length-1]||0;
+      const trendPct=trendBase?(((trendLast-trendBase)/trendBase)*100):0;
+      const trendClass=trendPct>=0?"up":"down";
+      document.getElementById("chartSummary").textContent=`last bucket: req ${last.requests||0}, err ${last.errors||0}, down ${fbytes(last.resp_bytes||0)} | ${avgOn?"avg ":"raw"} view`;
+      document.getElementById("peakReq").textContent=peakReq;
+      document.getElementById("peakErr").textContent=peakErr;
+      document.getElementById("peakDown").textContent=fbytes(peakDown);
+      document.getElementById("reqTrend").innerHTML=`<span class="${trendClass}">${trendPct>=0?"+":""}${trendPct.toFixed(1)}%</span>`;
+      document.getElementById("errSpike").textContent=spikeCount(rawErr);
+      document.getElementById("bucketCount").textContent=data.length;
+      ["peakReq","peakErr","peakDown","reqTrend","errSpike","bucketCount"].forEach(id=>{
+        const el=document.getElementById(id); if(!el)return;
+        el.classList.remove("pulse"); void el.offsetWidth; el.classList.add("pulse");
+      });
     }
     function drawStatusClassChart(statuses){
       const svg=document.getElementById("statusChart");
@@ -2728,16 +3323,25 @@ class ProxyServer:
       });
       document.getElementById("s_download_max_parallel").value=s.download_max_parallel||8;
       document.getElementById("settingsMeta").textContent=`route rules: ${s.route_rules_file||"-"} (${s.route_rules_count||0} rules) | auth: ${s.admin_auth_mode||"-"} | config: ${s.config_path||"not available"}`;
+      updateServiceUi(!!s.service_enabled);
+    }
+    function updateServiceUi(enabled){
+      const state=document.getElementById("serviceState");
+      const btn=document.getElementById("btnToggleService");
+      state.textContent=enabled?"VPN ON":"VPN OFF";
+      state.className="pill "+(enabled?"on":"off");
+      btn.textContent=enabled?"Turn VPN Off":"Turn VPN On";
     }
     function render(summary){
       state.summary=summary;
-      const t=summary.totals||{}, cache=summary.cache_store||{}, relay=summary.relay||{}, tg=summary.telegram?.stats||{}, uptime=summary.uptime_s||0;
+      const t=summary.totals||{}, cache=summary.cache_store||{}, relay=summary.relay||{}, tg=summary.telegram?.stats||{}, runtime=summary.runtime||{}, uptime=summary.uptime_s||0;
       const reqRate=uptime? (t.requests/uptime).toFixed(2) : "0.00";
       const cacheTotal=(cache.hits||0)+(cache.misses||0), cacheHitRate=cacheTotal?(100*(cache.hits||0)/cacheTotal):0;
       document.getElementById("uptime").textContent=fmtUptime(uptime);
       const cards=[
         ["Requests",t.requests||0],["Errors",`${t.errors||0} (${pct(t.error_rate_pct)})`],["Req/s avg",reqRate],["Upload",fbytes(t.req_bytes||0)],
         ["Download",fbytes(t.resp_bytes||0)],["Cache entries",cache.entries||0],["Cache hit rate",pct(cacheHitRate)],["Route rules",summary.route_rules?.count||0],
+        ["Active sessions",runtime.active_sessions||0],["Service state",(runtime.service_enabled===false?"OFF":"ON")],
         ["Relay fails",relay.failures||0],["Telegram decisions",tg.total||0]
       ];
       document.getElementById("cards").innerHTML=cards.map(c=>`<div class="card"><div class="label">${c[0]}</div><div class="value">${c[1]}</div></div>`).join("");
@@ -2760,7 +3364,7 @@ class ProxyServer:
       render(await res.json());
     }
     async function postJson(url,body){
-      const res=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})});
+      const res=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":csrfToken},body:JSON.stringify(body||{})});
       let data={};try{data=await res.json()}catch(_){}
       if(!res.ok){throw new Error("HTTP "+res.status);}
       return data;
@@ -2788,9 +3392,34 @@ class ProxyServer:
       }catch(_){toast("Config save failed",true);}
     }
     async function reloadRouteRules(){try{const d=await postJson("/api/route-rules/reload",{});toast(`Route rules loaded: ${d.count||0}`);await load();}catch(_){toast("Reload failed",true);}}
+    async function loadRulesText(){try{const d=await fetch("/api/route-rules",{cache:"no-store"});const j=await d.json();document.getElementById("rulesEditor").value=j.text||\"\";toast(\"Rules loaded\");}catch(_){toast(\"Rules load failed\",true);}}
+    async function saveRulesText(){try{const text=document.getElementById(\"rulesEditor\").value||\"\";const d=await postJson(\"/api/route-rules\",{text});if(d.ok){toast(`Rules saved (${d.count||0})`);await load();}else{toast((d.errors||[\"Save failed\"]).join(\"; \"),true);}}catch(_){toast(\"Rules save failed\",true);}}
+    async function testRuleHost(){try{const host=(document.getElementById(\"ruleTestHost\").value||\"\").trim();if(!host){toast(\"Enter host\",true);return;}const d=await postJson(\"/api/route-rules/test\",{host});if(d.ok)toast(`Matched action: ${d.action}`);else toast(d.error||\"Test failed\",true);}catch(_){toast(\"Test failed\",true);}}
     async function clearCache(){if(!confirm("Clear cache entries and cache counters?"))return;try{await postJson("/api/cache/clear",{});toast("Cache cleared");await load();}catch(_){toast("Cache clear failed",true);}}
     async function resetStats(){if(!confirm("Reset all telemetry counters?"))return;try{await postJson("/api/reset",{});toast("Telemetry reset");await load();}catch(_){toast("Reset failed",true);}}
+    async function toggleService(){
+      const current=(state.summary&&state.summary.settings)?!!state.summary.settings.service_enabled:true;
+      try{
+        const out=await postJson("/api/service",{enabled:!current});
+        toast(out.enabled?"VPN turned ON":"VPN turned OFF");
+        await load();
+      }catch(_){toast("VPN toggle failed",true);}
+    }
+    async function quickAction(action){
+      try{
+        const out=await postJson("/api/quick-action",{action});
+        if(action==="probe_relay"){
+          const p=out.probe||{};
+          if(p.ok) toast(`Relay OK (${p.status||0}, ${p.latency_ms||0}ms)`);
+          else toast(`Relay FAIL (${p.error||p.status||"unknown"})`,true);
+        }else{
+          toast(out.message||"Done");
+          await load();
+        }
+      }catch(_){toast("Action failed",true);}
+    }
     function downloadCsv(){window.open("/api/recent.csv","_blank");}
+    function downloadDiagnostics(){window.open("/api/diagnostics/bundle","_blank");}
     function downloadJson(){if(!state.summary)return;const blob=new Blob([JSON.stringify(state.summary,null,2)],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="mhrvpn_summary.json";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000);}
     function schedule(){if(state.timer)clearInterval(state.timer);const ms=Number(document.getElementById("refreshMs").value)||2000;state.timer=setInterval(()=>{if(document.getElementById("autoRefresh").checked)load();},ms);}
     document.getElementById("btnRefresh").addEventListener("click",load);
@@ -2799,13 +3428,21 @@ class ProxyServer:
     document.getElementById("btnSaveSettings").addEventListener("click",saveSettings);
     document.getElementById("btnSaveSettingsDisk").addEventListener("click",saveSettingsDisk);
     document.getElementById("btnReloadRules").addEventListener("click",reloadRouteRules);
+    document.getElementById("btnLoadRules").addEventListener("click",loadRulesText);
+    document.getElementById("btnSaveRules").addEventListener("click",saveRulesText);
+    document.getElementById("btnTestRule").addEventListener("click",testRuleHost);
+    document.getElementById("btnDiagBundle").addEventListener("click",downloadDiagnostics);
     document.getElementById("btnClearCache").addEventListener("click",clearCache);
     document.getElementById("btnReset").addEventListener("click",resetStats);
+    document.getElementById("btnToggleService").addEventListener("click",toggleService);
+    document.getElementById("btnOptimize").addEventListener("click",()=>quickAction("optimize"));
+    document.getElementById("btnProbeRelay").addEventListener("click",()=>quickAction("probe_relay"));
+    document.getElementById("btnPanicOff").addEventListener("click",()=>quickAction("panic_off"));
     document.getElementById("hostFilter").addEventListener("input",()=>state.summary&&render(state.summary));
     document.getElementById("s_top_hosts").addEventListener("input",()=>state.summary&&render(state.summary));
     document.getElementById("refreshMs").addEventListener("change",schedule);
-    ["chartReq","chartErr","chartDown"].forEach(id=>document.getElementById(id).addEventListener("change",()=>state.summary&&drawChart(state.summary.timeseries||[])));
-    load();schedule();
+    ["chartReq","chartErr","chartDown","chartAvg","chartNorm","chartWindow"].forEach(id=>document.getElementById(id).addEventListener("change",()=>state.summary&&drawChart(state.summary.timeseries||[])));
+    load();loadRulesText();schedule();
   </script>
 </body>
-</html>"""
+</html>""".replace("__CSRF_TOKEN__", self._admin_csrf_token)

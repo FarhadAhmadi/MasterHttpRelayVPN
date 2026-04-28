@@ -15,6 +15,7 @@ Welcome to the structured v1 documentation set.
 - [9. Security & Privacy](09-security-and-privacy.md)
 - [10. Troubleshooting](10-troubleshooting.md)
 - [11. v1 Roadmap & Next Versions](11-roadmap.md)
+- [12. Next Versions Guide (10x Plan)](12-next-versions-guide.md)
 
 ## Related Files
 

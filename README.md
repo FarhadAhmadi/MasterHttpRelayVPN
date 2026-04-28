@@ -9,6 +9,11 @@ Domain-fronted local proxy with Apps Script relay, Telegram Desktop compatibilit
 - **Farsi Index:** [`docs/fa/INDEX.md`](docs/fa/INDEX.md)
 - **Changelog:** [`CHANGELOG.md`](CHANGELOG.md)
 - **v1.3.0 Release Notes:** [`RELEASE_NOTES_v1.3.0.md`](RELEASE_NOTES_v1.3.0.md)
+- **v1.4.0 Release Notes:** [`RELEASE_NOTES_v1.4.0.md`](RELEASE_NOTES_v1.4.0.md)
+- **v1.5.0 Release Notes:** [`RELEASE_NOTES_v1.5.0.md`](RELEASE_NOTES_v1.5.0.md)
+- **v1.6.0 Release Notes:** [`RELEASE_NOTES_v1.6.0.md`](RELEASE_NOTES_v1.6.0.md)
+- **v1.7.0 Release Notes:** [`RELEASE_NOTES_v1.7.0.md`](RELEASE_NOTES_v1.7.0.md)
+- **v1.8.0 Release Notes:** [`RELEASE_NOTES_v1.8.0.md`](RELEASE_NOTES_v1.8.0.md)
 
 ## Quick Start
 
@@ -43,6 +48,40 @@ Switch smart profile:
 ```bash
 python main.py --profile strict_tg
 ```
+
+## Quick ON/OFF from Web App (New)
+
+- Keep the proxy process running (`python main.py` or your `runrelay` command).
+- Open admin panel: `http://127.0.0.1:9090`
+- Use the new **Turn VPN On/Off** button.
+- When OFF: dashboard stays online, but new HTTP/SOCKS proxy traffic is rejected.
+- When ON: proxy traffic resumes instantly (no restart needed).
+
+### Windows shortcut idea
+
+- Right click `start.bat` -> **Send to -> Desktop (create shortcut)**.
+- Rename shortcut to `VPN Start`.
+- Optional: set **Run** to *Minimized* in shortcut properties.
+- Create another shortcut for `vpn-dashboard.bat` to open dashboard quickly.
+
+### Windows auto-start helper scripts
+
+- Install startup task:
+  - `powershell -ExecutionPolicy Bypass -File scripts/windows/install-startup-task.ps1`
+- Remove startup task:
+  - `powershell -ExecutionPolicy Bypass -File scripts/windows/uninstall-startup-task.ps1`
+
+### Windows tray controller (Step 1)
+
+- Install optional tray dependencies:
+  - `py -3 -m pip install pystray pillow`
+- Start tray controller:
+  - double-click `tray-controller.bat`
+- Tray menu includes:
+  - Toggle ON/OFF
+  - Open Dashboard
+  - Start Relay
+  - Relay Probe
 
 ## Key v1 Features
 

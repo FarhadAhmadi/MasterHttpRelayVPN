@@ -16,7 +16,8 @@ This folder contains the complete, organized **Version 1 (v1)** documentation se
 ## Release References
 
 - **Changelog:** [`CHANGELOG.md`](../CHANGELOG.md)
-- **Latest release notes (v1.3.0):** [`RELEASE_NOTES_v1.3.0.md`](../RELEASE_NOTES_v1.3.0.md)
+- **Latest release notes (v1.6.0):** [`RELEASE_NOTES_v1.6.0.md`](../RELEASE_NOTES_v1.6.0.md)
+- **Next versions implementation guide:** [`docs/en/12-next-versions-guide.md`](en/12-next-versions-guide.md)
 
 ## Recommended Reading Order
 

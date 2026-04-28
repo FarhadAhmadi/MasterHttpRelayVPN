@@ -38,9 +38,9 @@ def setup_logging(level_name: str):
 
 
 _PLACEHOLDER_AUTH_KEYS = {
-    "",
-    "CHANGE_ME_TO_A_STRONG_SECRET",
-    "your-secret-password-here",
+    # "",
+    # "CHANGE_ME_TO_A_STRONG_SECRET",
+    # "your-secret-password-here",
 }
 
 

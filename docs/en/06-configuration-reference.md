@@ -23,6 +23,10 @@ Main config file: `config.json`
 
 - `admin_enabled`, `admin_host`, `admin_port`, `admin_token`
 - `admin_token_scopes` (token -> `read` / `write` / `admin`)
+- `proxy_service_enabled_on_start` (default ON)
+- `admin_auth_window_s`, `admin_auth_max_failures` (auth throttle)
+- `admin_force_loopback`, `admin_csrf_enabled`
+- `watchdog_enabled`, `watchdog_probe_interval_s`, `watchdog_failure_threshold`
 - `metrics_max_recent_events`
 - `metrics_bucket_seconds`, `metrics_max_buckets`
 - `metrics_redact_query`, `metrics_hash_hosts`, `metrics_include_recent_paths`
