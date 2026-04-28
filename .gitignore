@@ -39,4 +39,4 @@ domainfront_certs_*/
 logs/
 
 
-configs\scriptIds.txt
+configs/scriptIds.txt
